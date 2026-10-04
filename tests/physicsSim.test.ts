@@ -2,6 +2,7 @@
  * Board + rider physics scenarios (flat water on a calm ocean, waves on the default ocean).
  * Key numbers are printed so the calibration can be read from the test log.
  */
+import { Vector3 } from 'three';
 import { describe, expect, it } from 'vitest';
 import { DEFAULT_OCEAN_CONFIG, cloneOceanConfig } from '../src/ocean/oceanConfig';
 import { OceanModel } from '../src/ocean/waveModel';
@@ -9,6 +10,7 @@ import { BoardHull, createHullDiagnostics } from '../src/physics/BoardHull';
 import { BOARD_PRESETS, cloneBoardSpec, getBoardShape, type BoardSpec } from '../src/physics/boardShape';
 import { GRAVITY, RHO_WATER } from '../src/physics/constants';
 import { ImplicitSystem } from '../src/physics/implicit';
+import { RIDER_MODEL } from '../src/physics/Rider';
 import { RigidBody } from '../src/physics/RigidBody';
 import { lineupSpawn, waveSpawn } from '../src/physics/spawn';
 import { SurfSim, createSurfInput, type SurfInput } from '../src/physics/SurfSim';
@@ -449,7 +451,8 @@ describe('waves', () => {
   });
 });
 
-describe('rideability (autopilot, failure cases)', () => {
+// long simulations: generous timeouts (the default 5 s is tight on a loaded machine)
+describe('rideability (autopilot, failure cases)', { timeout: 30_000 }, () => {
   /** Autopilot ride from a waveSpawn: seconds standing in the ride phase, why it ended, turns. */
   function autopilotRide(from: number, side: 1 | -1, seconds = 12) {
     const ws = waveSpawn(ocean, { fromTime: from, side })!;
@@ -575,5 +578,172 @@ describe('rideability (autopilot, failure cases)', () => {
     const a = autopilotRide(40, -1, 4);
     const b = autopilotRide(40, -1, 4);
     expect([a.sim.board.position.x, a.sim.board.position.z, a.sim.rider.position.y]).toEqual([b.sim.board.position.x, b.sim.board.position.z, b.sim.rider.position.y]);
+  });
+});
+
+describe('robustness, contact and technique', { timeout: 30_000 }, () => {
+  it('practice mode (wipeouts off) stays bounded and puts the rider back on their feet', () => {
+    const cases: [string, SurfSim, number][] = [];
+    {
+      const sim = new SurfSim(calm, BOARD_PRESETS.shortboard, { wipeouts: false });
+      sim.reset({ x: -75, z: 5, headingRad: 0, stance: 'standing', speed: 0, time: 0 });
+      cases.push(['shortboard standing still, flat water', sim, 5]);
+    }
+    for (const spec of [BOARD_PRESETS.shortboard, BOARD_PRESETS.funboard]) {
+      const sim = new SurfSim(ocean, spec, { wipeouts: false });
+      sim.reset(lineupSpawn(ocean, 0));
+      const pop = createSurfInput();
+      pop.popUp = true;
+      sim.step(DT, pop);
+      cases.push([`${spec.id} pop-up at the lineup, no input`, sim, 8]);
+    }
+    const log: string[] = [];
+    for (const [name, sim, seconds] of cases) {
+      let maxV = 0;
+      let maxLeg = 0;
+      let maxStretch = 0;
+      const local = new Vector3();
+      run(sim, seconds, createSurfInput(), (s) => {
+        maxV = Math.max(maxV, s.board.velocity.length());
+        maxLeg = Math.max(maxLeg, s.telemetry.legForceN);
+        maxStretch = Math.max(maxStretch, s.board.worldToLocal(s.rider.position, local).distanceTo(s.rider.targetLocal));
+      });
+      log.push(`${name}: max |v| ${maxV.toFixed(1)} m/s, leg ${maxLeg.toFixed(0)} N, stretch ${maxStretch.toFixed(2)} m, ${sim.recoveries} recoveries (${sim.lastRecovery})`);
+      expect(sim.rider.stance).not.toBe('fallen');
+      expect(maxV).toBeLessThan(15); // was 1e19 (diverged within 3 s)
+      expect(maxLeg).toBeLessThan(5000); // was > 100 kN (stance target flipping with the board upside down)
+      expect(maxStretch).toBeLessThan(0.5);
+    }
+    console.log(`  practice: ${log.join(' | ')}`);
+    expect(cases[0][1].recoveries).toBeGreaterThan(0);
+  });
+
+  it('the stance target stays continuous with the board upside down (no target-velocity spikes)', () => {
+    const sim = new SurfSim(calm, BOARD_PRESETS.funboard, { wipeouts: false });
+    sim.reset({ x: -75, z: 5, headingRad: 0, stance: 'standing', speed: 0, time: 0 });
+    // roll the board (with the rider) slowly through 360° about its long axis, high above the water
+    sim.board.position.y += 20;
+    sim.board.updateDerived();
+    sim.rider.position.y += 20;
+    sim.extraBoardForce.set(0, sim.board.mass * GRAVITY, 0);
+    sim.extraRiderForce.set(0, sim.rider.config.mass * GRAVITY, 0);
+    let maxTv = 0;
+    const recover = (sim as unknown as { recover: () => void });
+    recover.recover = () => {}; // keep it attached whatever the orientation
+    run(sim, 4, createSurfInput(), (s) => {
+      s.board.angularVelocity.set(1.6 * s.board.R[0], 1.6 * s.board.R[3], 1.6 * s.board.R[6]);
+      maxTv = Math.max(maxTv, s.rider.targetVelLocal.length());
+    });
+    console.log(`  rolled 360°+: max target speed ${maxTv.toFixed(2)} m/s`);
+    expect(maxTv).toBeLessThan(3);
+  });
+
+  it('twist is internal: in free space it conserves angular momentum and turns the board only as far as the body winds', () => {
+    for (const spec of [BOARD_PRESETS.shortboard, BOARD_PRESETS.longboard]) {
+      const sim = new SurfSim(calm, spec, { wipeouts: false });
+      sim.reset({ x: 0, z: 0, headingRad: 0, stance: 'standing', speed: 0, time: 0 });
+      sim.board.position.y += 50;
+      sim.board.updateDerived();
+      sim.rider.position.y += 50;
+      sim.extraBoardForce.set(0, sim.board.mass * GRAVITY, 0);
+      sim.extraRiderForce.set(0, sim.rider.config.mass * GRAVITY, 0);
+      const L = (s: SurfSim) => {
+        const b = s.board;
+        const r = s.rider;
+        const l = b.angularMomentum(new Vector3());
+        l.add(new Vector3().crossVectors(b.position, b.velocity).multiplyScalar(b.mass));
+        l.add(new Vector3().crossVectors(r.position, r.velocity).multiplyScalar(r.config.mass));
+        return l.addScaledVector(new Vector3(b.R[1], b.R[4], b.R[7]), -r.twistInertia() * r.twistSpin);
+      };
+      const L0 = L(sim);
+      const input = createSurfInput();
+      input.twist = 1;
+      let yaw = 0;
+      let maxDL = 0;
+      run(sim, 2, input, (s) => {
+        yaw += s.rider.turnRate * DT;
+        maxDL = Math.max(maxDL, L(s).sub(L0).length());
+      });
+      console.log(`  ${spec.id}: twist held 2 s in free space: board yaw ${((yaw * 180) / Math.PI).toFixed(0)}°, upper body ${((sim.rider.twistAngle * 180) / Math.PI).toFixed(0)}°, max |ΔL| ${maxDL.toFixed(3)} N·m·s`);
+      expect(maxDL).toBeLessThan(0.5); // an external 40 N·m twist torque gave 41.8 N·m·s
+      expect(yaw).toBeGreaterThan(0.1); // nose right
+      expect(yaw).toBeLessThan(RIDER_MODEL.twistRange);
+      expect(sim.recoveries).toBe(0);
+    }
+  });
+
+  it('a grounded board with a standing rider does not chatter on the sand (implicit seabed friction)', () => {
+    const sim = new SurfSim(calm, BOARD_PRESETS.funboard, { wipeouts: false });
+    sim.reset({ x: 124, z: 5, headingRad: 0, stance: 'standing', speed: 0, time: 0 });
+    let prev = sim.board.velocity.x;
+    let prevD = 0;
+    let maxDv = 0;
+    let alternating = 0;
+    run(sim, 3, createSurfInput(), (s, i) => {
+      const v = s.board.velocity.x;
+      const d = v - prev;
+      if (i > 24) {
+        maxDv = Math.max(maxDv, Math.abs(d));
+        if (d * prevD < 0 && Math.abs(d) > 0.05 && Math.abs(prevD) > 0.05) alternating++;
+      }
+      prev = v;
+      prevD = d;
+    });
+    console.log(`  grounded funboard + rider: max |Δv_x| per step ${maxDv.toFixed(2)} m/s, ${alternating} alternating steps`);
+    expect(alternating).toBeLessThan(30); // explicit friction: 187
+    expect(maxDv).toBeLessThan(0.5); // explicit friction: 1.1 m/s per step
+  });
+
+  it('a fallen rider washed up the beach lies on the sand, not inside it', () => {
+    for (const x of [115, 130]) {
+      const sim = new SurfSim(ocean, BOARD_PRESETS.funboard);
+      sim.reset({ x, z: 5, headingRad: 0, stance: 'standing', speed: 0, time: 0 });
+      sim.rider.fall('balance', sim.board);
+      let worst = -Infinity;
+      run(sim, 12, createSurfInput(), (s) => {
+        const r = s.rider.position;
+        worst = Math.max(worst, ocean.bathymetry.seabedY(r.x, r.z) - r.y);
+      });
+      const r = sim.rider.position;
+      console.log(`  fallen from x=${x}: ends at x=${r.x.toFixed(1)}, COM ${(r.y - ocean.bathymetry.seabedY(r.x, r.z)).toFixed(2)} m above the sand (lowest ${(-worst).toFixed(2)} m)`);
+      expect(worst).toBeLessThan(0); // the body COM never goes below the sand (was 0.3–1 m under)
+    }
+  });
+
+  it('prone: steering without paddling pivots the board 180° on the spot in 3–5 s (back-paddling the inside arm)', () => {
+    for (const spec of [BOARD_PRESETS.funboard, BOARD_PRESETS.longboard]) {
+      const sim = new SurfSim(calm, spec);
+      sim.reset(lineupSpawn(calm, 0));
+      const input = createSurfInput();
+      input.steer = -1;
+      let yaw = 0;
+      let t180 = Infinity;
+      run(sim, 6, input, (s, i) => {
+        yaw += s.rider.turnRate * DT;
+        if (t180 === Infinity && yaw < -Math.PI) t180 = i * DT;
+      });
+      const moved = Math.hypot(sim.board.position.x + 75, sim.board.position.z - 5);
+      console.log(`  ${spec.id}: pivot 180° in ${t180.toFixed(1)} s (moved ${moved.toFixed(1)} m)`);
+      expect(sim.rider.stance).toBe('prone');
+      expect(t180).toBeLessThan(5);
+      expect(t180).toBeGreaterThan(2);
+      expect(moved).toBeLessThan(2);
+    }
+  });
+
+  it('the autopilot turns round and paddles back out to its take-off spot quickly', () => {
+    const ap = new Autopilot(ocean, { autoReset: Infinity, side: 1 });
+    const sim = new SurfSim(ocean, BOARD_PRESETS.funboard);
+    // inside, facing the beach, in the lull between sets
+    sim.reset({ x: ap.config.takeoffX + 18, z: ap.config.takeoffZ, headingRad: 0, stance: 'prone', speed: 0, time: 120 });
+    const input = createSurfInput();
+    let t = 0;
+    for (; t < 30 && ap.status.phase === 'position'; t += DT) {
+      ap.update(sim, DT, input);
+      sim.step(DT, input);
+    }
+    console.log(`  back out 18 m from facing the beach: ${ap.status.phase} after ${t.toFixed(1)} s`);
+    expect(ap.status.phase).not.toBe('position');
+    expect(t).toBeLessThan(25);
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CdlodSelector } from '../src/render/cdlod';
+import { CdlodSelector, MIN_LOD_SCALE } from '../src/render/cdlod';
 import { mulberry32 } from '../src/ocean/waveModel';
 
 interface Patch {
@@ -55,10 +55,17 @@ describe('CDLOD selection', () => {
     y: [0.6, 2, 3.5, 12, 45, 180][i % 6],
     z: (rng() - 0.5) * 400,
   }));
+  // LOD distance scales: 60° camera (1), telephoto (≈ 15°: the minimum, 0.35), 35° (0.55); the scaled
+  // variants on a subset of the cameras (they select many more patches)
+  const cases = [
+    ...cams.map((cam) => ({ cam, scale: 1 })),
+    ...cams.slice(1, 3).map((cam) => ({ cam, scale: CdlodSelector.lodScaleForFov((15 * Math.PI) / 180) })),
+    ...cams.slice(9, 11).map((cam) => ({ cam, scale: CdlodSelector.lodScaleForFov((35 * Math.PI) / 180) })),
+  ];
 
   it('covers the disc around the camera exactly once (no holes, no overlaps)', () => {
-    for (const cam of cams) {
-      sel.select(cam, null);
+    for (const { cam, scale } of cases) {
+      sel.select(cam, null, scale);
       const ps = patches(sel);
       const R = Math.sqrt(sel.ranges[sel.levels - 1] ** 2 - cam.y * cam.y) * 0.98;
       for (let n = 0; n < 4000; n++) {
@@ -77,9 +84,10 @@ describe('CDLOD selection', () => {
     }
   });
 
-  it('neighbouring patches share identical (morphed) edge vertices', () => {
-    for (const cam of cams) {
-      sel.select(cam, null);
+  /** Every edge shared by two patches has identical morphed vertices on both sides. */
+  function checkSharedEdges(list: typeof cases): void {
+    for (const { cam, scale } of list) {
+      sel.select(cam, null, scale);
       const ps = patches(sel);
       // Index edge vertices by their exact morphed position per edge line.
       const key = (axis: number, c: number): string => `${axis}:${c}`;
@@ -127,6 +135,42 @@ describe('CDLOD selection', () => {
       }
       expect(shared).toBeGreaterThan(50);
     }
+  }
+
+  it('neighbouring patches share identical (morphed) edge vertices', () => {
+    checkSharedEdges(cases.filter((c) => c.scale === 1));
+  });
+
+  it('… also with a telephoto / narrow LOD scale', () => {
+    checkSharedEdges(cases.filter((c) => c.scale !== 1));
+  }, 60_000);
+
+  it('a telephoto view gets finer levels where it looks than the 60° camera\'s distance levels', () => {
+    // the beach camera: ≈ 160 m from the board, ≈ 8° field of view
+    const cam = { x: 124, y: 4.2, z: -55 };
+    const board = { x: -35, z: 0 };
+    // frustum stand-in: a ±6° wedge toward the board
+    const dir = Math.atan2(board.z - cam.z, board.x - cam.x);
+    const wedge = (x: number, z: number, s: number): boolean => {
+      if (x <= cam.x && cam.x <= x + s && z <= cam.z && cam.z <= z + s) return true;
+      const pts = [[x, z], [x + s, z], [x, z + s], [x + s, z + s], [x + s / 2, z + s / 2]];
+      const a = pts.map(([px, pz]) => Math.atan2(pz - cam.z, px - cam.x) - dir).map((v) => Math.atan2(Math.sin(v), Math.cos(v)));
+      return Math.min(...a) < 0.1 && Math.max(...a) > -0.1;
+    };
+    const levelAt = (scale: number): number => {
+      sel.select(cam, wedge, scale);
+      for (const p of patches(sel)) {
+        const s = p.cell * p.cells;
+        if (board.x >= p.x && board.x < p.x + s && board.z >= p.z && board.z < p.z + s) return p.level;
+      }
+      return -1;
+    };
+    expect(levelAt(1)).toBeGreaterThanOrEqual(2);
+    expect(levelAt(CdlodSelector.lodScaleForFov((8 * Math.PI) / 180))).toBeLessThanOrEqual(1);
+    expect(sel.count[0] + sel.count[1]).toBeLessThan(sel.capacity);
+    expect(CdlodSelector.lodScaleForFov(Math.PI / 3)).toBeCloseTo(1, 9);
+    expect(CdlodSelector.lodScaleForFov((80 * Math.PI) / 180)).toBe(1);
+    expect(CdlodSelector.lodScaleForFov((3 * Math.PI) / 180)).toBe(MIN_LOD_SCALE);
   });
 
   it('keeps the vertex count in budget for a typical view', () => {

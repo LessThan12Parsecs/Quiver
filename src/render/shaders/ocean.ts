@@ -2,10 +2,13 @@
  * Water surface shaders (CDLOD ocean mesh, see OceanMesh.ts).
  *
  * Vertex: each instanced patch vertex is morphed toward the next coarser grid near the end of
- * its LOD range (CDLOD), then displaced with OCEAN_GLSL: wind chop (Lagrangian, components
- * shorter than ~3 grid cells faded out — identical to oceanSurface() where the grid resolves
- * them) and the shoaling swell. The swell gradient is taken by central differences over one
- * grid cell; the chop gradient is analytic in the fragment shader.
+ * its LOD range (CDLOD, LOD distances scaled by the field of view), then displaced with
+ * OCEAN_GLSL: wind chop (Lagrangian, components shorter than ~3 grid cells faded out —
+ * identical to oceanSurface() where the grid resolves them) and the shoaling swell, plus the
+ * render-only breaking geometry (BREAKER_GLSL: pitching lip, foam roller mound). The swell
+ * gradient is taken by central differences over one grid cell (where the breaker geometry is
+ * active, the normal of the displaced surface comes from the same differences: vLip); the chop
+ * gradient is analytic in the fragment shader. Far levels (grid >= 90 m) skip the swell.
  *
  * Fragment:
  *  - Pixel footprint from the camera model and the interpolated swell normal (smooth; dFdx of
@@ -17,15 +20,21 @@
  *    with analytic gradients return the slope variance lost to filtering -> GGX roughness.
  *    Detail amplitude varies with drifting wind gusts and wind-aligned slicks; on steep faces a
  *    stretched copy of the detail adds streaks running down the face.
+ *  - Back faces: the surface seen from below when the camera is under water (uCameraUnderwater,
+ *    set from the CPU surface); above water they are the underside of a breaking lip (shaded
+ *    with the flipped lip normal) or crest-silhouette slivers (shaded like the front face).
  *  - Schlick Fresnel, PMREM sky reflection, GGX sun glitter, water body colour from single
  *    scattering + Beer-Lambert over the sand seabed along the refracted ray, subsurface glow of
  *    thin backlit crests and lips, foam (breaking crests/faces, trailing bores, lingering
  *    surf-zone lace, whitecaps) with a lumpy relief: bump-mapped lumps and bubble domes,
  *    crease occlusion, thin translucent vs thick opaque foam, and aerial perspective.
  *
- * Shading-quality defines: DETAIL_LAYERS (1-3), FOAM_DETAIL (0/1), FACE_DETAIL (0/1).
+ * Shading-quality defines: DETAIL_LAYERS (1-3), FOAM_DETAIL (0/1), FACE_DETAIL (0/1),
+ * WIND_PATTERNS (0/1: drifting gusts, slicks and the detail domain warp — 5 value-noise calls
+ * per pixel).
  */
 import { OCEAN_GLSL } from '../../ocean/waveGLSL';
+import { BREAKER_GLSL } from './breaker';
 import { ENV_GLSL, NOISE_GLSL } from './common';
 
 export const MAX_LODS = 16;
@@ -38,12 +47,17 @@ varying vec4 vSwellA;   // swell eta, local wave height, breaking, fullness
 varying vec4 vSwellB;   // cos psi, sin psi, ratio, still-water depth
 varying vec4 vSwellC;   // dominant direction xz, phase speed, wavenumber
 varying vec2 vLod;      // lod level + morph, grid spacing
+varying vec4 vLip;      // breaker geometry: normal of the displaced surface (xyz), weight (w)
+varying float vLipClear; // share of the breaker offset that is the thrown (clear-water) lip
 `;
 
 export const OCEAN_VERTEX = /* glsl */ `
 ${OCEAN_GLSL}
+${NOISE_GLSL}
+${BREAKER_GLSL}
 #define MAX_LODS ${MAX_LODS}
-uniform vec3 uLodOrigin;
+uniform float uTime;
+uniform vec4 uLodOrigin;   // camera x, |y|, z; LOD distance scale (tan(fov/2) / tan(30 deg))
 uniform vec2 uLodMorph[MAX_LODS];
 attribute vec4 aNode;   // patch origin x, z, grid spacing, lod level
 ${VARYINGS}
@@ -76,26 +90,52 @@ void main() {
   vec2 rest0 = aNode.xy + g * cell;
   vec3 dl = vec3(rest0.x - uLodOrigin.x, uLodOrigin.y, rest0.y - uLodOrigin.z);
   vec2 mr = uLodMorph[int(aNode.w + 0.5)];
-  float morph = clamp((length(dl) - mr.x) * mr.y, 0.0, 1.0);
+  float morph = clamp((length(dl) * uLodOrigin.w - mr.x) * mr.y, 0.0, 1.0);
   vec2 rest = rest0 - fract(g * 0.5) * 2.0 * morph * cell;
   float spacing = cell * (1.0 + morph);
 
   vec3 w = oceanWindLod(rest, spacing);
   vec2 p = rest + w.xz;
-  OceanSwell sw = oceanSwell(p);
-  // Far away (grid >~ 20 m) the swell is sub-pixel: fade it rather than alias it.
-  float swellFade = 1.0 - smoothstep(16.0, 40.0, spacing);
-  float h = 0.5 * spacing;
-  float ex = oceanSwell(p + vec2(h, 0.0)).eta - oceanSwell(p - vec2(h, 0.0)).eta;
-  float ez = oceanSwell(p + vec2(0.0, h)).eta - oceanSwell(p - vec2(0.0, h)).eta;
-  vSwellSlope = vec2(ex, ez) * (swellFade / (2.0 * h));
-
-  vec3 pos = vec3(p.x, w.y + sw.eta * swellFade, p.y);
+  // Far away (grid of 40-90 m: ~2-3 cells per swell wavelength) the swell would alias: fade it
+  // out; beyond that skip it (uniform per patch: no divergence).
+  float swellFade = 1.0 - smoothstep(40.0, 90.0, spacing);
+  vec3 pos = vec3(p.x, w.y, p.y);
+  vSwellSlope = vec2(0.0);
+  vSwellA = vec4(0.0);
+  vSwellB = vec4(1.0, 0.0, 0.0, 0.0);
+  vSwellC = vec4(1.0, 0.0, 0.0, 0.0);
+  vLip = vec4(0.0, 1.0, 0.0, 0.0);
+  vLipClear = 0.0;
+  if (swellFade > 0.0) {
+    OceanSwell sw = oceanSwell(p);
+    float h = 0.5 * spacing;
+    OceanSwell sxp = oceanSwell(p + vec2(h, 0.0));
+    OceanSwell sxm = oceanSwell(p - vec2(h, 0.0));
+    OceanSwell szp = oceanSwell(p + vec2(0.0, h));
+    OceanSwell szm = oceanSwell(p - vec2(0.0, h));
+    vSwellSlope = vec2(sxp.eta - sxm.eta, szp.eta - szm.eta) * (swellFade / (2.0 * h));
+    pos.y += sw.eta * swellFade;
+    vSwellA = vec4(sw.eta * swellFade, sw.height * swellFade, sw.breaking, sw.fullness);
+    vSwellB = vec4(cos(sw.psi), sin(sw.psi), min(sw.ratio, 8.0), sw.depth);
+    vSwellC = vec4(sw.dir, sw.speed, sw.k);
+    if (breakerActive(sw)) {
+      // breaking lip / roller: displace, and take the normal of the displaced surface
+      float lipClear;
+      vec3 b0 = breakerOffset(sw, p, uTime, spacing, lipClear);
+      vLipClear = lipClear;
+      vec3 bxp = breakerOffset(sxp, p + vec2(h, 0.0), uTime, spacing);
+      vec3 bxm = breakerOffset(sxm, p - vec2(h, 0.0), uTime, spacing);
+      vec3 bzp = breakerOffset(szp, p + vec2(0.0, h), uTime, spacing);
+      vec3 bzm = breakerOffset(szm, p - vec2(0.0, h), uTime, spacing);
+      pos += b0;
+      vec3 dx = vec3(2.0 * h, sxp.eta - sxm.eta, 0.0) + bxp - bxm;
+      vec3 dz = vec3(0.0, szp.eta - szm.eta, 2.0 * h) + bzp - bzm;
+      float act = length(b0) + length(bxp - bxm) + length(bzp - bzm);
+      vLip = vec4(normalize(cross(dz, dx)), smoothstep(0.01, 0.06, act));
+    }
+  }
   vWorldPos = pos;
   vRest = rest;
-  vSwellA = vec4(sw.eta * swellFade, sw.height * swellFade, sw.breaking, sw.fullness);
-  vSwellB = vec4(cos(sw.psi), sin(sw.psi), min(sw.ratio, 8.0), sw.depth);
-  vSwellC = vec4(sw.dir, sw.speed, sw.k);
   vLod = vec2(aNode.w + morph, spacing);
   gl_Position = projectionMatrix * viewMatrix * vec4(pos, 1.0);
 }
@@ -114,6 +154,9 @@ ${OCEAN_GLSL}
 #endif
 #ifndef FACE_DETAIL
 #define FACE_DETAIL 1
+#endif
+#ifndef WIND_PATTERNS
+#define WIND_PATTERNS 1
 #endif
 
 uniform float uTime;
@@ -141,6 +184,7 @@ uniform float uFoamIntensity;
 uniform float uSssIntensity;
 uniform float uCausticsIntensity;
 uniform float uRoughness;                  // base GGX alpha
+uniform float uCameraUnderwater;           // 1 when the camera is below the water surface (CPU)
 uniform int uDebug;
 ${VARYINGS}
 
@@ -274,17 +318,19 @@ vec3 foamRelief(vec2 x, float t, float fp, float fpLong, out float crease) {
 }
 #endif
 
-// Animated caustic network on the seabed (mean ~1); sharp in very shallow water, blurring with depth.
+// Animated caustic network on the seabed (mean ~1); sharp only in very shallow, clear water:
+// suspended sand and bubbles in the surf zone (uTurbidity) blur and dim it with depth.
 float caustics(vec2 x, float t, float fp, float depth) {
-  float aa = (1.0 - smoothstep(0.01, 0.035, fp)) * (1.0 - smoothstep(0.3, 1.8, depth));
-  if (aa <= 0.0) return 1.0;
+  float aa = (1.0 - smoothstep(0.01, 0.035, fp)) * (1.0 - smoothstep(0.3, 1.8, depth)) * exp(-0.9 * uTurbidity * depth);
+  if (aa <= 0.01) return 1.0;
   vec2 warp = vec2(vnoise(x * 0.9 + 0.3 * t), vnoise(x * 0.9 + 9.1 - 0.3 * t)) - 0.5;
   vec2 w1 = worley(x * 2.3 + warp, t * 1.2);
   vec2 w2 = worley(x * 3.1 + warp * 1.3 + 4.7, -t * 1.0);
-  float e1 = 1.0 - smoothstep(0.0, 0.16, w1.y - w1.x);
-  float e2 = 1.0 - smoothstep(0.0, 0.16, w2.y - w2.x);
+  float blur = 0.16 + 0.4 * uTurbidity * depth;
+  float e1 = 1.0 - smoothstep(0.0, blur, w1.y - w1.x);
+  float e2 = 1.0 - smoothstep(0.0, blur, w2.y - w2.x);
   float c = 0.55 * e1 + 0.45 * e2 + 1.2 * e1 * e2;
-  return mix(1.0, 0.72 + 1.1 * c, aa);
+  return mix(1.0, 0.76 + 0.95 * c, aa);
 }
 
 float ggxD(float NdotH, float a2) {
@@ -315,8 +361,14 @@ void main() {
   vec3 V = toCam / dist;
   vec3 L = uSunDirection;
 
+  // Breaking lip / roller geometry (render only): its own normal; the folded underside of a lip
+  // is seen from its back side.
+  float lipW = gl_FrontFacing || uCameraUnderwater < 0.5 ? vLip.w : 0.0;
+  vec3 Nlip = normalize(vLip.xyz) * (gl_FrontFacing ? 1.0 : -1.0);
+
   // Pixel footprint (ray differentials on the plane of the interpolated swell normal), in metres.
   vec3 Nsw = normalize(vec3(-vSwellSlope.x, 1.0, -vSwellSlope.y));
+  if (lipW > 0.0) Nsw = normalize(mix(Nsw, Nlip, lipW));
   vec3 dpx;
   vec3 dpy;
   pixelFootprint(P, Nsw, dpx, dpy);
@@ -347,11 +399,14 @@ void main() {
   float faceExt = clamp(2.0 * kDom * (0.5 + 2.4 * H), 0.2, 1.8) * mix(0.35, 1.0, bs);
   float backExt = clamp(kDom * (0.4 + 1.2 * H), 0.08, 0.5);
   // ragged edges: jitter the phase window with ~1-4 m noise along the crest
-  float psiJ = psi + (vnoise(P.xz * vec2(0.35, 0.25)) - 0.5) * 0.6 * faceExt + (vnoise(P.xz * 1.1 + 7.0) - 0.5) * 0.22 * faceExt;
+  float psiJ = psi;
+  if (brk > 0.0) psiJ += (vnoise(P.xz * vec2(0.35, 0.25)) - 0.5) * 0.6 * faceExt + (vnoise(P.xz * 1.1 + 7.0) - 0.5) * 0.22 * faceExt;
   // (the front transition is wide: the foam pattern, thresholded by the coverage, cuts a chunky
   // broken leading edge into it)
   float onFace = smoothstep(-backExt - 0.15, -backExt * 0.3, psiJ) * (1.0 - smoothstep(faceExt * 0.45, faceExt * 1.15, psiJ));
   float white = onFace * smoothstep(0.0, 0.45, brk) * smoothstep(0.05, 0.7, H);
+  // the thrown lip is a clear sheet of water (it turns white where it lands: the roller)
+  white *= 1.0 - 0.85 * smoothstep(0.05, 0.4, vLipClear);
   // Trailing foam carpet left behind the roller, thinning out with time since the crest passed;
   // bigger breakers leave more and longer-lasting foam.
   float age = mod(-psi, 2.0 * PI) / omega;
@@ -362,12 +417,17 @@ void main() {
 
   // ---- normal: swell + chop (geometry) + spectral detail ------------------------------------
   // Wind gusts / cat's paws (slowly drifting rougher patches) and wind-aligned slicks.
+#if WIND_PATTERNS
   vec2 gp = (P.xz - uWindDrift * uTime) / 60.0;
   float gust = 0.5 + 1.1 * vnoise(gp) * (0.55 + 0.45 * vnoise(gp * 2.7 + 5.0));
   vec2 wd = normalize(uWindDrift + vec2(1e-5, 0.0));
   vec2 sp = vec2(dot(P.xz, wd), dot(P.xz, vec2(-wd.y, wd.x))) * vec2(1.0 / 90.0, 1.0 / 8.0);
   float slick = smoothstep(0.72, 0.84, vnoise(sp + vec2(3.1 + 0.004 * uTime, 0.03 * uTime)));
   slick *= 1.0 - smoothstep(0.8, 2.5, fp);
+#else
+  float gust = 0.92;   // mean of the gust field
+  float slick = 0.0;
+#endif
   // no ripples under dense whitewater
   float detAmp = gust * (1.0 - 0.55 * slick) * (1.0 - 0.9 * smoothstep(0.5, 0.9, max(white, trail)));
 
@@ -377,14 +437,22 @@ void main() {
   vec3 Ng = normalize(vec3(-macro.x, 1.0, -macro.y));
   vec3 Tx = normalize(vec3(1.0, macro.x, 0.0));
   vec3 Tz = normalize(vec3(0.0, macro.y, 1.0));
+  if (lipW > 0.0) {
+    // lip / roller: the chop rides on the displaced surface's normal
+    Ng = normalize(mix(Ng, bumpNormal(Nlip, macro - vSwellSlope), lipW));
+    Tx = normalize(Tx - Ng * dot(Tx, Ng));
+    Tz = normalize(Tz - Ng * dot(Tz, Ng));
+  }
 
   // Detail coordinates follow the wave profile (x - 0.6 y ~ arc length on the front face, so
   // steep faces aren't smeared), with a slow domain warp (no straight infinite crests).
   vec2 xd = vec2(P.x - 0.6 * P.y, P.z) - uDetailOrigin;
   vec2 gx = vec2(dpx.x - 0.6 * dpx.y, dpx.z);
   vec2 gy = vec2(dpy.x - 0.6 * dpy.y, dpy.z);
+#if WIND_PATTERNS
   vec2 wq = P.xz * (1.0 / 13.0) + uTime * 0.015;
   xd += (vec2(vnoise(wq), vnoise(wq + 7.31)) - 0.5) * 0.8;
+#endif
   float detVar = 0.0;
   // the 4.2 m layer (the most visible scale near the camera) is always sampled
   vec3 det = detailLayer(uDetail1, uDetailL1, uDetailOff01.zw, xd, gx, gy, fp, detAmp, detVar);
@@ -419,9 +487,10 @@ void main() {
 #endif
   vec3 N = normalize(Ng - Tx * det.x - Tz * det.y);
 
-  // Back faces seen from above (distant wave backs leaking through depth-buffer precision gaps
-  // near the horizon) are shaded like front faces.
-  if (!gl_FrontFacing && (cameraPosition.y < P.y + 0.3 || dist < 40.0)) {
+  // Back faces: the surface seen from below only when the camera is under water. Above water
+  // they are a lip's underside (lip normal, flipped above) or slivers of the far side of a crest
+  // winning the depth test at its silhouette — shaded like the front face (no dark specks).
+  if (!gl_FrontFacing && uCameraUnderwater > 0.5) {
     // Seen from below (camera underwater): Snell's window to the sky, total internal reflection
     // of the dark water outside it, attenuated along the in-water path to the eye.
     vec3 Nd = -N;

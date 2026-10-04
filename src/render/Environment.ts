@@ -98,7 +98,7 @@ export class Environment {
   readonly renderer: THREE.WebGLRenderer;
   private readonly scene: THREE.Scene;
   private readonly model: SkyModel;
-  private readonly pmrem: THREE.PMREMGenerator;
+  private pmrem: THREE.PMREMGenerator;
   private readonly envScene = new THREE.Scene();
   private readonly envSky: Sky;
   private readonly ground: THREE.Mesh<THREE.SphereGeometry, THREE.ShaderMaterial>;
@@ -198,6 +198,17 @@ export class Environment {
     this.elevationDeg = elevationDeg;
     this.azimuthDeg = azimuthDeg;
     sunDirectionFromAngles(elevationDeg, azimuthDeg, this.sunDirection);
+    this.refresh();
+  }
+
+  /**
+   * After a WebGL context restore: render-target contents (the PMREM environment map: the water's
+   * sky reflection and scene.environment) are gone. The old GL objects belonged to the lost
+   * context, so they are dropped rather than deleted, and the map is generated again.
+   */
+  restoreContext(): void {
+    this.pmrem = new THREE.PMREMGenerator(this.renderer);
+    this.envTarget = null;
     this.refresh();
   }
 

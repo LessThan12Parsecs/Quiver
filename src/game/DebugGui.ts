@@ -135,7 +135,8 @@ export class DebugGui {
     const fs = gui.addFolder('Session');
     add(fs.add(ui, 'board', Object.keys(BOARD_PRESETS)).name('board (keeps pose)')).onChange((v: BoardPresetId) => game.setBoard(v));
     add(fs.add(ui, 'mass', 45, 120, 1).name('rider mass kg')).onChange((v: number) => game.setRiderMass(v));
-    add(fs.add(ui, 'assist', 0, 1, 0.01).name('balance assist')).onChange((v: number) => (sim.rider.config.balanceAssist = v));
+    // the rider's balance reflex, tuned at 0.85 (not "easier" toward 1: the gains over-drive)
+    add(fs.add(ui, 'assist', 0, 1, 0.01).name('balance reflex (0.85 tuned)')).onChange((v: number) => (sim.rider.config.balanceAssist = v));
     add(fs.add(ui, 'wipeouts')).onChange((v: boolean) => (sim.rider.config.wipeouts = v));
     add(fs.add(ui, 'side', { 'left (−Z)': -1, 'right (+Z)': 1, auto: 0 }).name('wave spawn side')).onChange((v: SpawnSide) => (game.spawnSide = Number(v) as SpawnSide));
     add(fs.add(ui, 'camera', CAMERA_MODES).name('camera (C)')).onChange((v: CameraMode) => game.setCameraMode(v));

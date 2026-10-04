@@ -14,8 +14,9 @@ export {
 } from './OceanMesh';
 export { MAX_TILE_COMPONENTS, RippleTile, type RippleTileOptions } from './DetailNormals';
 export { BeachMesh, type BeachMeshOptions } from './BeachMesh';
-export { DEFAULT_SPRAY_REGIONS, Spray, type SprayOptions, type SprayRegion } from './Spray';
-export { CDLOD_MORPH_START, CdlodSelector, PatchKind, type CdlodOptions } from './cdlod';
+export { BoardWake } from './BoardWake';
+export { DEFAULT_SPRAY_REGIONS, SPRAY_RENDER_ORDER, Spray, type SprayOptions, type SprayRegion } from './Spray';
+export { CDLOD_MORPH_START, CdlodSelector, MIN_LOD_SCALE, PatchKind, type CdlodOptions } from './cdlod';
 export { DEFAULT_SKY_PARAMS, SkyModel, luminance, type SkyParams } from './skyModel';
 export { ENV_GLSL, NOISE_GLSL } from './shaders/common';
 export {

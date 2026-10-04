@@ -48,12 +48,16 @@
       #balance-text b { color: var(--ink); font: 600 13px var(--mono); }
       #hud-ride { position: absolute; top: 18px; left: 50%; transform: translateX(-50%); padding: 7px 16px; border-radius: 999px; font: 600 14px var(--mono); letter-spacing: 0.04em; background: rgba(20, 120, 100, 0.55); border: 1px solid rgba(95, 224, 200, 0.5); opacity: 0; transition: opacity 0.25s; }
       #hud-ride.on { opacity: 1; }
-      #hud-message { position: absolute; left: 50%; top: 30%; width: max-content; max-width: 86vw; transform: translate(-50%, -50%); text-align: center; opacity: 0; transition: opacity 0.3s; }
+      #hud-ride.caught { background: rgba(150, 105, 10, 0.62); border-color: rgba(255, 200, 87, 0.7); }
+      /* the message stays in the free centre column between the stats panel (left, ≤ 290 px) and
+         the controls panel (right, ≤ 300 px), wraps, and sits above both on narrow screens */
+      #hud-message { position: absolute; left: 50%; top: 30%; z-index: 2; width: max-content; max-width: max(300px, min(86vw, calc(100vw - 640px))); transform: translate(-50%, -50%); text-align: center; opacity: 0; transition: opacity 0.3s; }
       #hud-message.on { opacity: 1; }
-      #hud-message .big { font: 800 40px/1.05 var(--sans); letter-spacing: 0.02em; text-shadow: 0 2px 18px rgba(0, 0, 0, 0.45); }
-      #hud-message .small { margin-top: 8px; font: 500 15px var(--sans); color: var(--ink); text-shadow: 0 1px 8px rgba(0, 0, 0, 0.6); }
+      #hud-message .big { font: 800 clamp(26px, 3.1vw, 40px)/1.08 var(--sans); letter-spacing: 0.02em; text-shadow: 0 2px 18px rgba(0, 0, 0, 0.45); }
+      #hud-message .small { margin-top: 8px; font: 500 15px/1.4 var(--sans); color: var(--ink); white-space: pre-line; text-shadow: 0 1px 8px rgba(0, 0, 0, 0.6); }
       #hud-message.bad .big { color: #fff; }
-      #hud-hint { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); max-width: 70vw; padding: 8px 14px; font-size: 13px; text-align: center; opacity: 0; transition: opacity 0.4s; }
+      /* above the status box (bottom right) so the two never overlap */
+      #hud-hint { position: absolute; z-index: 2; left: 50%; bottom: 52px; transform: translateX(-50%); width: max-content; max-width: min(70vw, calc(100vw - 40px)); box-sizing: border-box; padding: 8px 14px; font-size: 13px; text-align: center; opacity: 0; transition: opacity 0.4s; }
       #hud-hint.on { opacity: 1; }
       #hud-status { position: absolute; right: 14px; bottom: 14px; padding: 6px 10px; font: 500 11px var(--mono); color: var(--dim); }
       #hud-status b { color: var(--warn); font-weight: 600; }
@@ -115,7 +119,7 @@
           <tr><td><kbd>F</kbd></td><td>force arrows + water probes</td></tr>
           <tr><td><kbd>H</kbd> <kbd>G</kbd></td><td>this help · debug panel</td></tr>
         </table>
-        <p>Catch a set wave: point at the beach, paddle as the steep face arrives, pop up when the board starts to run. Keep the balance dot inside the ring. Mouse: drag to look around, wheel to zoom.</p>
+        <p>Catch a set wave: wait just outside where the sets break, point at the beach, paddle as the steep face arrives, pop up when <b>CAUGHT</b> shows (the board runs with the wave). Keep the balance dot inside the ring. Mouse: drag to look around, wheel to zoom, double-click to recentre.</p>
       </div>
     </div>
     <div id="fatal"></div>

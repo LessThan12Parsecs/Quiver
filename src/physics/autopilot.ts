@@ -1,6 +1,7 @@
 /**
  * Autopilot surfer: a scripted, skilled rider that only produces SurfInput (the same controls a
- * player has: paddle/steer, pop-up, lean, trim, crouch, twist). No forces, no state tweaks — if it
+ * player has: paddle/steer, pop-up, lean, trim, crouch; it does not twist — an internal torque
+ * that only winds the board against the body). No forces, no state tweaks — if it
  * rides well, the physics allows riding well. It is a test tool (rideability metrics) and a game
  * feature (key O): watch a good ride and copy it.
  *
@@ -43,6 +44,8 @@ export interface AutopilotConfig {
   takeoffZ: number;
   /** Preferred riding side: +1 (toward +Z), −1, or 0 = decide per wave (alternate). */
   side: 1 | -1 | 0;
+  /** Waiting: drift from the take-off spot (m) after which it paddles back. */
+  driftDist: number;
   /** Smallest wave (height seen outside) worth going for, m, and how far seaward its crest is
    * when the rider starts paddling for it, m. */
   minHeight: number;
@@ -83,6 +86,7 @@ export const DEFAULT_AUTOPILOT: AutopilotConfig = {
   takeoffX: -38,
   takeoffZ: 5,
   side: 0,
+  driftDist: 7,
   minHeight: 1.15,
   triggerDist: 22,
   popPhase: 0.15,
@@ -281,7 +285,8 @@ export class Autopilot {
     return Math.atan2(sim.board.R[6], sim.board.R[0]);
   }
 
-  /** Prone steering toward a world heading: paddle harder on the outside arm. */
+  /** Prone steering toward a world heading (paddle harder on the outside arm; without paddle
+   * effort the inside arm back-paddles: a pivot on the spot). Returns the heading error. */
   private steerProne(sim: SurfSim, target: number, out: SurfInput): number {
     const e = wrap(target - this.heading(sim));
     const yaw = sim.rider.turnRate;
@@ -337,8 +342,9 @@ export class Autopilot {
     }
     // close enough and a set wave is coming: go for it from here
     if (dist < 12 && this.phaseTime > 1 && this.goForWave(sim)) return;
-    this.steerProne(sim, Math.atan2(dz, dx), out);
-    out.paddle = dist > 8 ? 1 : 0.6;
+    const e = this.steerProne(sim, Math.atan2(dz, dx), out);
+    // facing well off the course: pivot first (paddling while steering only arcs round)
+    out.paddle = Math.abs(e) > 0.5 ? 0 : dist > 8 ? 1 : 0.6;
   }
 
   private doWait(sim: SurfSim, out: SurfInput): void {
@@ -348,11 +354,11 @@ export class Autopilot {
     const dist = Math.hypot(tx - b.position.x, tz - b.position.z);
     // face the beach, angled a little toward the riding side
     const waveDir = Math.atan2(this.dirZ, this.dirX);
-    const e = this.steerProne(sim, waveDir + st.side * 12 * DEG, out);
-    if (Math.abs(e) > 0.4) out.paddle = 0.3;
+    this.steerProne(sim, waveDir + st.side * 12 * DEG, out);
     if (this.phaseTime > 1.5 && this.goForWave(sim)) return;
-    // drifted: paddle back (the wave train pushes the board shoreward between sets)
-    if (dist > 12) this.setPhase('position');
+    // drifted: paddle back before it takes long (the wave train pushes the board shoreward
+    // between sets)
+    if (dist > this.config.driftDist) this.setPhase('position');
   }
 
   /** Look outside for an approaching set wave (the next crest seaward within triggerDist) and
@@ -491,8 +497,6 @@ export class Autopilot {
     if (Math.abs(u0 + this.headI) < uMax) this.headI = clamp(this.headI + cfg.steerI * e * dt, -uMax, uMax);
     const u = clamp(u0 + this.headI, -uMax, uMax);
     out.leanSide = s * u;
-    // low speed: help the turn with a twist
-    if (v < 4 && Math.abs(e) > 0.3) out.twist = s * clamp(1.5 * e, -1, 1);
 
     // --- trim: weight forward for speed when the curl is close or the board is slow for its
     // line, back to slow down / hold the top of the face; crouch through turns and whitewater

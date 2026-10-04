@@ -211,6 +211,11 @@ export class RippleTile {
     return this.target.texture;
   }
 
+  /** Force the next `update` to redraw (the render target's contents were lost: context restore). */
+  invalidate(): void {
+    this.lastTime = Number.NaN;
+  }
+
   /** Regenerate the tile for animation time `time` (s); no-op if unchanged. */
   update(renderer: THREE.WebGLRenderer, time: number): void {
     if (time === this.lastTime) return;

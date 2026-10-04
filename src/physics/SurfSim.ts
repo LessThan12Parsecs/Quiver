@@ -10,11 +10,13 @@
  *  1. ocean.setTime(time); rider stance controller → target COM (board space) + body layout.
  *  2. Water: probe grid under the board (hull.sampleWater), one sample at the board COM (water
  *     state for telemetry and the rider's water plane), plus one at the rider when detached.
- *  3. Forces: gravity, hull + fins (BoardHull), body segments + paddling (Rider), twist torque,
- *     legs (attached: 3-axis spring-damper to the target point) or leash (fallen).
+ *  3. Forces: gravity, hull + fins (BoardHull), body segments + paddling + ground contact
+ *     (Rider), twist (upper body wound against the board: an internal torque pair), legs
+ *     (attached: 3-axis spring-damper to the target point) or leash (fallen).
  *  4. Linearly implicit Euler on [v_board, ω_board, v_rider] (ImplicitSystem), implicit
  *     gyroscopic term, then positions/orientation.
- *  5. Balance (ankle torque from the effective leg force), wipeout checks, telemetry, pose.
+ *  5. Balance (ankle torque from the effective leg force), wipeout checks (practice mode, wipeouts
+ *     off: recovery in place instead), telemetry, pose.
  */
 import { Matrix4, Quaternion, Vector3 } from 'three';
 import type { OceanModel, SurfaceSample } from '../ocean/waveModel';
@@ -23,7 +25,7 @@ import { BoardHull, createHullDiagnostics, type HullDiagnostics } from './BoardH
 import { BOARD_PRESETS, getBoardShape, type BoardShape, type BoardSpec } from './boardShape';
 import { GRAVITY, PHYSICS_DT } from './constants';
 import { ImplicitSystem } from './implicit';
-import { RIDER_MODEL, Rider, createWaterPlane, type RiderConfig, type Stance, type WaterPlane, type WipeoutReason } from './Rider';
+import { RIDER_MODEL, Rider, boardYawRate, createWaterPlane, type RiderConfig, type Stance, type WaterPlane, type WipeoutReason } from './Rider';
 import { RigidBody } from './RigidBody';
 
 /** Player input for one step. Axes are −1..1 (0..1 for paddle/crouch); positive = right / forward. */
@@ -186,6 +188,10 @@ export class SurfSim {
   hullRollMoment = 0;
   /** The last spawn passed to reset(). */
   lastSpawn: Spawn | null = null;
+  /** Practice mode (rider.config.wipeouts off): times the rider was put back on their feet
+   * instead of falling, and the fall that was caught. */
+  recoveries = 0;
+  lastRecovery: WipeoutReason | null = null;
 
   private readonly sys = new ImplicitSystem();
   private readonly u = new Float64Array(9);
@@ -205,6 +211,8 @@ export class SurfSim {
   /** Leg spring axes (3 × world unit vectors) and their explicit forces (scratch). */
   private readonly legAxes = new Float64Array(9);
   private readonly legF = new Float64Array(3);
+  private readonly legD = new Float64Array(3);
+  private readonly legV = new Float64Array(3);
   private riderDampingC = 0;
   private centreCells: number[] = [];
   private noseCells: number[] = [];
@@ -331,6 +339,33 @@ export class SurfSim {
     this.fillTelemetry(0);
   }
 
+  /**
+   * Practice mode: instead of falling, the rider gets back up where they are — board upright on
+   * the water along its heading at its current speed (board + rider COM), rider standing (prone if
+   * they were prone), all transient state cleared. `lastSpawn` is kept (R/T still mean the same).
+   */
+  private recover(reason: WipeoutReason): void {
+    const b = this.board;
+    const r = this.rider;
+    const mb = b.mass;
+    const mr = r.config.mass;
+    const hx = b.R[0], hz = b.R[6];
+    const hn = Math.hypot(hx, hz) || 1;
+    const vAlong = ((mb * b.velocity.x + mr * r.velocity.x) * hx + (mb * b.velocity.z + mr * r.velocity.z) * hz) / ((mb + mr) * hn);
+    const spawn = this.lastSpawn;
+    this.reset({
+      x: b.position.x,
+      z: b.position.z,
+      headingRad: Math.atan2(hz, hx),
+      stance: r.stance === 'prone' ? 'prone' : 'standing',
+      speed: vAlong,
+      time: this.time,
+    });
+    this.lastSpawn = spawn;
+    this.recoveries++;
+    this.lastRecovery = reason;
+  }
+
   /** Net upward force on board + rider (static pose at COM height y, spawn velocity). */
   private netVerticalForce(y: number): number {
     const b = this.board;
@@ -362,6 +397,9 @@ export class SurfSim {
     out.velX = s.velX;
     out.velY = s.velY;
     out.velZ = s.velZ;
+    out.seabed = -s.depth;
+    out.seabedSlopeX = 0;
+    out.seabedSlopeZ = 0;
   }
 
   /** Advance the simulation by dt (intended: 1/240 s). */
@@ -386,7 +424,13 @@ export class SurfSim {
     const under = ocean.sample(b.position.x, b.position.z, this.underSample);
     const plane = this.riderPlane;
     if (r.attached) this.makePlane(under, b.position.x, b.position.z, plane);
-    else this.makePlane(ocean.sample(r.position.x, r.position.z, this.riderSample), r.position.x, r.position.z, plane);
+    else {
+      const rx = r.position.x, rz = r.position.z;
+      this.makePlane(ocean.sample(rx, rz, this.riderSample), rx, rz, plane);
+      // seabed slope under the fallen body (ground contact on the beach face), central over 1 m
+      plane.seabedSlopeX = ocean.depthAt(rx - 0.5, rz) - ocean.depthAt(rx + 0.5, rz);
+      plane.seabedSlopeZ = ocean.depthAt(rx, rz - 0.5) - ocean.depthAt(rx, rz + 0.5);
+    }
     r.layoutSegments(b);
 
     // --- forces (the hull adds its added mass to M, so M is set first)
@@ -420,13 +464,23 @@ export class SurfSim {
     this.riderDampingC = r.segmentForces(plane, b, ext, tq);
     const segFx = ext.x - this.extraRiderForce.x, segFy = ext.y - this.extraRiderForce.y + mr * GRAVITY, segFz = ext.z - this.extraRiderForce.z;
     r.paddleForces(dt, input, plane, b, ext, tq);
+    r.groundForces(plane, sys, ext);
     sys.addRiderForce(ext.x, ext.y, ext.z);
     sys.addRiderDamping(this.riderDampingC);
     if (r.attached) sys.addBoardTorque(tq.x, tq.y, tq.z);
-    // twist: yaw torque about the deck normal (positive input turns the nose to the right, −Y)
-    if (r.stance === 'standing' || r.stance === 'popping') {
-      const t = -Math.max(-1, Math.min(1, input.twist)) * RIDER_MODEL.twistTorque * r.standWeight();
-      sys.addBoardTorque(b.R[1] * t, b.R[4] * t, b.R[7] * t);
+    // twist (standing): the trunk muscles wind the upper body against the board about the deck
+    // normal n — an internal torque pair (+ input: upper body left, board nose right). The upper
+    // body's yaw momentum turns with the board's tilt: the board carries ω × h of it.
+    if (r.stance === 'standing') {
+      const R = b.R;
+      const tau = r.twistUpdate(dt, input.twist, boardYawRate(b));
+      const w = b.angularVelocity;
+      const h = -r.twistInertia() * r.twistSpin; // upper body yaw momentum along +n
+      sys.addBoardTorque(
+        R[1] * tau - h * (w.y * R[7] - w.z * R[4]),
+        R[4] * tau - h * (w.z * R[1] - w.x * R[7]),
+        R[7] * tau - h * (w.x * R[4] - w.y * R[1]),
+      );
     }
 
     // --- gyroscopic term (implicit, board + attached body inertia), then velocity vector
@@ -496,6 +550,8 @@ export class SurfSim {
         const k = axis === 2 ? kLat : k0;
         const c = axis === 2 ? cLat : c0;
         fa[axis] = -k * (d - dt * tdot) - c * v;
+        this.legD[axis] = d;
+        this.legV[axis] = v;
       }
       let satRoll = false, satPitch = false;
       if (w > 0) {
@@ -509,13 +565,20 @@ export class SurfSim {
       r.ankleSaturated = satRoll || satPitch;
       for (let axis = 0; axis < 3; axis++) {
         const ax = ax3[3 * axis], ay = ax3[3 * axis + 1], az = ax3[3 * axis + 2];
-        const f = fa[axis];
-        sys.addRiderForce(ax * f, ay * f, az * f);
-        sys.addBoardForce(-ax * f, -ay * f, -az * f, rx, ry, rz);
+        const k = axis === 2 ? kLat : k0;
+        const c = axis === 2 ? cLat : c0;
         const sat = (axis === 2 && satRoll) || (axis === 1 && satPitch);
         // a saturated ankle transmits a constant (capped) force: the foot rolls on its edge, so
-        // that axis has no stiffness or damping this step
-        if (!sat) sys.addLink(ax, ay, az, rx, ry, rz, axis === 2 ? cLat : c0, axis === 2 ? kLat : k0);
+        // that axis has no stiffness or damping this step — up to the legs' reach (an impact
+        // stretch, where the rider falls or practice mode recovers): past it the spring is back,
+        // so a rider hanging off a saturated ankle can never be dragged away from the board
+        const d = this.legD[axis];
+        const over = sat ? Math.abs(d) - RIDER_MODEL.impactStretch : 0;
+        let f = fa[axis];
+        if (over > 0) f -= k * (Math.sign(d) * over - dt * (ax * tvx + ay * tvy + az * tvz)) + c * this.legV[axis];
+        sys.addRiderForce(ax * f, ay * f, az * f);
+        sys.addBoardForce(-ax * f, -ay * f, -az * f, rx, ry, rz);
+        if (!sat || over > 0) sys.addLink(ax, ay, az, rx, ry, rz, c, k);
       }
     } else {
       const ll = this.leashLocal;
@@ -563,6 +626,8 @@ export class SurfSim {
       r.filterAcceleration((mb * du[0] + mr * du[6]) * im, (mb * du[1] + mr * du[7]) * im, (mb * du[2] + mr * du[8]) * im, dt);
     }
 
+    if (r.stance === 'standing') r.integrateTwist(dt, boardYawRate(b));
+
     // --- positions
     b.integratePosition(dt);
     r.position.addScaledVector(r.velocity, dt);
@@ -575,10 +640,20 @@ export class SurfSim {
       const lost = r.updateBalance(dt, b);
       const vrx = b.velocity.x - under.velX, vry = b.velocity.y - under.velY, vrz = b.velocity.z - under.velZ;
       const fwd = vrx * b.R[0] + vry * b.R[3] + vrz * b.R[6];
-      let reason = r.checkWipeout(dt, b.R[4], noseDepth, fwd, deckDepth, legStretch);
       // pitched over the front with the nose in the water: the nose caught (pearl)
-      if (!reason && lost) reason = r.tipOver === 'forward' && noseDepth > 0 ? 'pearl' : 'balance';
+      const tip: WipeoutReason | null = lost ? (r.tipOver === 'forward' && noseDepth > 0 ? 'pearl' : 'balance') : null;
+      const reason = r.checkWipeout(dt, b.R[4], noseDepth, fwd, deckDepth, legStretch) ?? tip;
       if (reason && r.config.wipeouts) r.fall(reason, b);
+      else if (reason) {
+        // practice (no wipeouts): a body past recovery, a flipped board or over-stretched legs have
+        // no attached state to carry on from (the legs would hang the rider off a saturated
+        // ankle): put the rider back on their feet in place. A pearl or a buried board is ridden on.
+        const caught = reason === 'flipped' ? reason : (tip ?? (legStretch > RIDER_MODEL.impactStretch ? 'impact' : null));
+        if (caught) {
+          this.recover(caught);
+          return;
+        }
+      }
     }
     this.telemetry.deckDepth = deckDepth;
     this.telemetry.noseDepth = noseDepth;

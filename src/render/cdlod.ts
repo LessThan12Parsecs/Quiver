@@ -7,7 +7,11 @@
  * intersects the sphere of radius ranges[L] around the camera but not ranges[L-1]; otherwise its
  * children are visited, and children out of the finer range are drawn as "quarter" patches
  * (P/2 x P/2 cells) at the parent's spacing. Distances are 3D from the camera to the node's square
- * at y = 0 (the shader uses the same metric for morphing, see `morphFactor`).
+ * at y = 0 (the shader uses the same metric for morphing, see `morphFactor`), scaled by
+ * `lodScale` = tan(fov/2) / tan(30°), clamped to [MIN_LOD_SCALE, 1]: the levels follow the
+ * projected size on screen, so a telephoto camera (the beach camera, ≈ 8°) gets 0.5 m cells under
+ * the board it frames instead of 2–4 m ones (wider lenses keep scale 1). The top level's reach
+ * (the horizon) stays the unscaled `maxDistance`.
  *
  * Crack-free guarantee: vertices of level L morph toward the level L+1 grid between
  * morphStart[L] and ranges[L] (odd grid coordinates collapse onto the lower even neighbour). With
@@ -18,6 +22,8 @@
 
 /** Fraction of a level's range [ranges[L-1], ranges[L]] after which morphing starts. */
 export const CDLOD_MORPH_START = 0.7;
+/** Smallest field-of-view LOD scale (see CdlodSelector.lodScaleForFov). */
+export const MIN_LOD_SCALE = 0.35;
 
 export interface CdlodOptions {
   /** Cells per patch side (power of two, >= 8). */
@@ -59,6 +65,8 @@ export class CdlodSelector {
   /** Distance where level L starts morphing toward L+1 (Infinity for the top level). */
   morphStart: number[] = [];
   levels = 0;
+  /** Distance scale of the last selection (tan(fov/2) / tan(30°), see the header). */
+  lodScale = 1;
 
   /**
    * Selected patches per kind: stride 5 = [originX, originZ, gridSpacing, level, sortKey]
@@ -72,6 +80,7 @@ export class CdlodSelector {
   private cy = 0;
   private cz = 0;
   private visible: NodeVisibility | null = null;
+  private k2 = 1;
 
   constructor(opts: CdlodOptions = {}, capacity = 8192) {
     this.patchResolution = opts.patchResolution ?? 32;
@@ -112,22 +121,40 @@ export class CdlodSelector {
     });
   }
 
-  /** Morph factor of a vertex at 3D distance d in a level-L patch (same formula as the shader). */
+  /**
+   * Morph factor of a vertex at 3D distance d in a level-L patch, for the last selection's
+   * `lodScale` (same formula as the shader).
+   */
   morphFactor(level: number, d: number): number {
     const s = this.morphStart[level];
     if (!Number.isFinite(s)) return 0;
-    return Math.min(Math.max((d - s) / (this.ranges[level] - s), 0), 1);
+    return Math.min(Math.max((d * this.lodScale - s) / (this.ranges[level] - s), 0), 1);
+  }
+
+  /**
+   * LOD distance scale for a perspective projection with vertical field of view `fovRad`. Never
+   * above 1: the crack-free margins (a node's diagonal vs. the gap to the next level's morph
+   * start) are sized for unscaled distances and only grow when distances shrink. Never below
+   * MIN_LOD_SCALE: a long lens looks at grazing water far away, where cells sized for the
+   * horizontal pixel density are far below a pixel vertically (the 8° beach camera: 1.24 M
+   * vertices at the full scale 0.12, 232 k at 0.35 — the board's cells 0.5 m instead of 2 m).
+   */
+  static lodScaleForFov(fovRad: number): number {
+    return Math.min(Math.max(Math.tan(fovRad / 2) / Math.tan(Math.PI / 6), MIN_LOD_SCALE), 1);
   }
 
   /**
    * Select patches for a camera at `cam` (y = height above sea level). `visible` culls nodes
-   * (e.g. a frustum test of the node's padded box); null = no culling. Results in data/count.
+   * (e.g. a frustum test of the node's padded box); null = no culling. `lodScale` (≤ 1) scales
+   * the LOD distances (see the header; lodScaleForFov). Results in data/count.
    */
-  select(cam: CameraLike, visible: NodeVisibility | null): void {
+  select(cam: CameraLike, visible: NodeVisibility | null, lodScale = 1): void {
     this.cx = cam.x;
     this.cy = Math.abs(cam.y);
     this.cz = cam.z;
     this.visible = visible;
+    this.lodScale = lodScale;
+    this.k2 = lodScale * lodScale;
     this.count[0] = 0;
     this.count[1] = 0;
     const top = this.levels - 1;
@@ -157,8 +184,10 @@ export class CdlodSelector {
   private node(x: number, z: number, level: number): boolean {
     const size = this.nodeSize(level);
     const r = this.ranges[level];
-    const d2 = this.dist2(x, z, size);
-    if (d2 >= r * r) return false;
+    const dTrue2 = this.dist2(x, z, size);
+    // LOD decisions in scaled distance; the top level reaches maxDistance whatever the scale
+    const d2 = dTrue2 * this.k2;
+    if ((level === this.levels - 1 ? dTrue2 : d2) >= r * r) return false;
     if (!this.isVisible(x, z, size)) return true;
     const cell = size / this.patchResolution;
     if (level === 0) {

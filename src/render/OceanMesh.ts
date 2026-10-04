@@ -18,8 +18,11 @@
  * scales: 16 m (tile A), 4.2 m and 1.1 m (tile B), each rotated relative to the wind.
  *
  * Quality: `quality` sets the vertex density (CDLOD ranges); `shading` sets the fragment cost
- * (detail layers, foam relief, face streaks, tile size / anisotropy). By default a quality preset
- * also picks the matching shading level (low -> low, medium -> medium, high/ultra -> high).
+ * (detail layers, foam relief, face streaks, wind gust/slick patterns, tile size / anisotropy).
+ * By default a quality preset also picks the matching shading level (low -> low, medium ->
+ * medium, high/ultra -> high). LOD distances are scaled by the camera's field of view
+ * (tan(fov/2) / tan 30°, clamped to [0.35, 1]: cdlod.ts), so a telephoto view keeps finer cells
+ * where it looks.
  */
 import * as THREE from 'three';
 import { DEFAULT_OCEAN_CONFIG } from '../ocean/oceanConfig';
@@ -41,6 +44,8 @@ export interface OceanShadingPreset {
   foamDetail: boolean;
   /** Streaks on steep wave faces. */
   faceDetail: boolean;
+  /** Drifting wind gusts / slicks and the detail domain warp (5 value-noise calls per pixel). */
+  windPatterns: boolean;
   /** Ripple tile B (4.2 m; layers 1, 2, face streaks) resolution (texels) and wave components. */
   tileSize: number;
   components: number;
@@ -53,9 +58,9 @@ export interface OceanShadingPreset {
 }
 
 export const OCEAN_SHADING: Record<OceanShading, OceanShadingPreset> = {
-  low: { layers: 1, foamDetail: false, faceDetail: false, tileSize: 128, components: 64, tileSizeA: 0, componentsA: 0, anisotropy: 2 },
-  medium: { layers: 2, foamDetail: false, faceDetail: true, tileSize: 256, components: 96, tileSizeA: 128, componentsA: 64, anisotropy: 2 },
-  high: { layers: 3, foamDetail: true, faceDetail: true, tileSize: 256, components: 128, tileSizeA: 128, componentsA: 64, anisotropy: 4 },
+  low: { layers: 1, foamDetail: false, faceDetail: false, windPatterns: false, tileSize: 128, components: 64, tileSizeA: 0, componentsA: 0, anisotropy: 2 },
+  medium: { layers: 2, foamDetail: false, faceDetail: true, windPatterns: true, tileSize: 256, components: 96, tileSizeA: 128, componentsA: 64, anisotropy: 2 },
+  high: { layers: 3, foamDetail: true, faceDetail: true, windPatterns: true, tileSize: 256, components: 128, tileSizeA: 128, componentsA: 64, anisotropy: 4 },
 };
 
 const SHADING_FOR_QUALITY: Record<OceanQuality, OceanShading> = { low: 'low', medium: 'medium', high: 'high', ultra: 'high' };
@@ -257,7 +262,7 @@ export class OceanMesh {
       uniforms: {
         ...shaderData.uniforms,
         ...env.uniforms,
-        uLodOrigin: { value: new THREE.Vector3() },
+        uLodOrigin: { value: new THREE.Vector4(0, 0, 0, 1) },
         uLodMorph: { value: lodMorph },
         uTime: { value: 0 },
         uWindDrift: { value: windDir.clone().multiplyScalar(windSpeed * 0.5) },
@@ -284,12 +289,14 @@ export class OceanMesh {
         uSssIntensity: { value: 1 },
         uCausticsIntensity: { value: 1 },
         uRoughness: { value: 0.03 },
+        uCameraUnderwater: { value: 0 },
         uDebug: { value: 0 },
       },
       defines: { ...env.envDefines },
       vertexShader: OCEAN_VERTEX,
       fragmentShader: OCEAN_FRAGMENT,
-      // back faces = the surface seen from below (underwater camera)
+      // back faces: the surface seen from below (underwater camera) and the underside of a
+      // breaking lip (shaders/breaker.ts)
       side: THREE.DoubleSide,
     });
     this.look = new WaterLook(this.material.uniforms);
@@ -355,6 +362,7 @@ export class OceanMesh {
     d.DETAIL_LAYERS = p.layers;
     d.FOAM_DETAIL = p.foamDetail ? 1 : 0;
     d.FACE_DETAIL = p.faceDetail ? 1 : 0;
+    d.WIND_PATTERNS = p.windPatterns ? 1 : 0;
     this.material.needsUpdate = true;
   }
 
@@ -382,24 +390,29 @@ export class OceanMesh {
 
   /**
    * Per frame, before rendering with `camera`: select LOD patches and set animation time.
-   * `time` is the ocean (simulation) time in seconds used for ripples/foam animation; the wave
-   * geometry itself follows OceanShaderData (model.setTime + shaderData.update).
+   * `time` is the ocean (simulation) time in seconds used for ripples/foam/breaker animation; the
+   * wave geometry itself follows OceanShaderData (model.setTime + shaderData.update).
+   * `waterHeight` = the (CPU) water surface height under the camera: back faces are shaded as the
+   * surface seen from below only when the camera is under it (default: mean sea level).
    */
-  update(camera: THREE.Camera, time: number): void {
+  update(camera: THREE.Camera, time: number, waterHeight = 0): void {
     camera.updateMatrixWorld();
     camera.getWorldPosition(this.camPos);
     const u = this.material.uniforms;
     const cam = this.camPos;
-    (u.uLodOrigin.value as THREE.Vector3).set(cam.x, Math.abs(cam.y), cam.z);
-    u.uTime.value = time;
-    this.renderer.getDrawingBufferSize(this.bufSize);
+    // LOD by projected size: distances scaled by tan(fov/2) / tan(30°) (p5 = 1 / tan(fov/2))
     const p5 = camera.projectionMatrix.elements[5];
+    const lodScale = CdlodSelector.lodScaleForFov(2 * Math.atan(1 / Math.max(Math.abs(p5), 1e-6)));
+    (u.uLodOrigin.value as THREE.Vector4).set(cam.x, Math.abs(cam.y), cam.z, lodScale);
+    u.uTime.value = time;
+    u.uCameraUnderwater.value = cam.y < waterHeight ? 1 : 0;
+    this.renderer.getDrawingBufferSize(this.bufSize);
     u.uPixelAngle.value = 2 / (Math.max(Math.abs(p5), 1e-6) * Math.max(this.bufSize.y, 1));
     this.updateDetail(cam, time);
 
     this.projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     this.frustum.setFromProjectionMatrix(this.projView, camera.coordinateSystem, camera.reversedDepth);
-    this.lod.select(cam, this.visibleFn);
+    this.lod.select(cam, this.visibleFn, lodScale);
     this.upload(0, this.fullGeo);
     this.upload(1, this.quarterGeo);
     const [nf, nq] = this.lod.count;
@@ -408,6 +421,11 @@ export class OceanMesh {
     this.stats.patches = nf + nq;
     this.stats.vertices = nf * vf + nq * vq;
     this.stats.triangles = nf * this.P * this.P * 2 + (nq * this.P * this.P) / 2;
+  }
+
+  /** Redraw the ripple tiles on the next update (after a WebGL context restore). */
+  invalidateDetail(): void {
+    for (const t of this.tiles) t.invalidate();
   }
 
   dispose(): void {

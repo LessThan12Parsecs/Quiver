@@ -1,7 +1,13 @@
 /**
  * Camera modes (C cycles):
  *   follow  behind/above the board along its (smoothed) nose heading; mouse drag orbits around
- *           the board, wheel zooms, double-click recentres.
+ *           the board, wheel zooms, double-click recentres. Two automatic framings blend in:
+ *           - look-back (prone, a set wave's crest approaching from behind): the view swings
+ *             round to face the sea, so the wave you are about to catch is in frame;
+ *           - riding: the camera drops low (≈ 0.7 m above the water: below the crest) into the
+ *             flats in front of the face, behind the rider, looking along the line and up the
+ *             face (55° from the crest line toward the face), so the slope, the lip and the line
+ *             ahead read.
  *   orbit   OrbitControls around the moving board (the target follows the board).
  *   beach   a filmer on the beach (x ≈ 122 m) with a telephoto lens tracking the board.
  *   side    a filmer in the water off to the side, perpendicular to the swell, lagging behind.
@@ -27,11 +33,16 @@ export interface CameraTarget {
   stance: Stance;
   /** Horizontal unit direction the wave under the board travels in (x, 0, z). */
   waveDir: THREE.Vector3;
-  /** True while the board is riding a wave (follow cam moves toward the shore side). */
+  /** True while the rider is riding a wave (follow cam: low, in front of the face). */
   riding: boolean;
+  /** A set wave's crest is approaching from behind (follow cam: look back at it). */
+  lookBack: boolean;
 }
 
-const FOV = { follow: 60, orbit: 55, side: 48 };
+const FOV = { follow: 60, followRide: 66, orbit: 55, side: 48 };
+/** Follow cam while riding: angle of the view from the crest line toward the face (rad), distance
+ * behind the focus (m), height above the water under the camera (m). */
+const RIDE_VIEW = { angle: (55 * Math.PI) / 180, dist: 5, height: 0.7 };
 /** Minimum camera height above the water surface, m. */
 const MIN_CLEARANCE = 0.45;
 
@@ -48,8 +59,14 @@ export class CameraRig {
   private yawOffset = 0;
   private pitchOffset = 0;
   private sideSign = 1;
-  /** Follow cam: smoothed lateral offset toward the shore while riding, m. */
-  private shoreShift = 0;
+  /** Follow cam: blend toward the riding framing / the look-back (0..1). */
+  private rideBlend = 0;
+  private backBlend = 0;
+  /** Follow cam: which way the look-back swings round (±1), the riding direction along the
+   * crest (±1, hysteresis) and the smoothed riding view azimuth (rad). */
+  private backSign = 1;
+  private rideSide = 1;
+  private rideYaw = 0;
   private readonly focus = new THREE.Vector3();
   private readonly look = new THREE.Vector3();
   private readonly desired = new THREE.Vector3();
@@ -132,10 +149,44 @@ export class CameraRig {
 
     switch (this.mode) {
       case 'follow': {
-        this.setFov(FOV.follow, snap, dt);
-        const dist = (standing ? 6.2 : t.stance === 'fallen' ? 6 : 4.6) * this.zoom;
+        const kb = (tau: number): number => (snap ? 1 : 1 - Math.exp(-dt / tau));
+        // automatic framings (see the header)
+        const wx = t.waveDir.x;
+        const wz = t.waveDir.z;
+        const wl = Math.hypot(wx, wz);
+        const riding = t.riding && wl > 0.5;
+        if (riding) {
+          // riding direction along the crest (tangent (−wz, wx)), with hysteresis
+          const vt = (-wz * t.velocity.x + wx * t.velocity.z) / wl;
+          if (Math.abs(vt) > 1.5 || this.rideBlend < 0.01) this.rideSide = vt >= 0 ? 1 : -1;
+          // view: along the line, turned toward the face (seaward = −waveDir)
+          const a = RIDE_VIEW.angle;
+          const ex = (-wz * this.rideSide * Math.cos(a) - wx * Math.sin(a)) / wl;
+          const ez = (wx * this.rideSide * Math.cos(a) - wz * Math.sin(a)) / wl;
+          const target = Math.atan2(ez, ex);
+          this.rideYaw = this.rideBlend < 0.01 ? target : this.rideYaw + wrapPi(target - this.rideYaw) * kb(0.5);
+        }
+        this.rideBlend += ((riding ? 1 : 0) - this.rideBlend) * kb(riding ? 0.7 : 0.4);
+        const back = t.lookBack && t.stance === 'prone' && wl > 0.5;
+        if (back && this.backBlend < 0.01) {
+          // swing round on the side that is shorter from the current heading
+          const sea = Math.atan2(-wz, -wx);
+          this.backSign = wrapPi(sea - this.yaw) >= 0 ? 1 : -1;
+        }
+        this.backBlend += ((back ? 1 : 0) - this.backBlend) * kb(back ? 0.8 : 0.5);
+        let yaw = this.yaw;
+        if (this.backBlend > 1e-3 && wl > 0.5) {
+          // face the sea, a little off-axis so the rider doesn't hide the wave
+          let d = wrapPi(Math.atan2(-wz, -wx) + this.backSign * 0.25 - yaw);
+          if (Math.abs(d) > 2.6 && Math.sign(d) !== this.backSign) d += this.backSign * 2 * Math.PI;
+          yaw += d * this.backBlend;
+        }
+        if (this.rideBlend > 1e-3) yaw += wrapPi(this.rideYaw - yaw) * this.rideBlend;
+        yaw += this.yawOffset;
+        const rb = this.rideBlend;
+        this.setFov(FOV.follow + (FOV.followRide - FOV.follow) * rb, snap, dt);
+        const dist = ((standing ? 6.2 : t.stance === 'fallen' ? 6 : 4.6) * (1 - rb) + RIDE_VIEW.dist * rb) * this.zoom;
         const height = (standing ? 2.3 : 1.7) * Math.sqrt(this.zoom);
-        const yaw = this.yaw + this.yawOffset;
         const elev = Math.atan2(height, dist) + this.pitchOffset;
         const cy = Math.cos(yaw);
         const sy = Math.sin(yaw);
@@ -145,25 +196,16 @@ export class CameraRig {
           this.focus.y + r * Math.sin(elev),
           this.focus.z - sy * r * Math.cos(elev),
         );
-        // riding down the line: slide out in front of the face (toward the shore, ⟂ heading) so
-        // the camera looks back up the wave instead of straight along the crest
-        const wx = t.waveDir.x;
-        const wz = t.waveDir.z;
-        const along = wx * cy + wz * sy;
-        let px = wx - along * cy;
-        let pz = wz - along * sy;
-        const pl = Math.hypot(px, pz);
-        const shiftTarget = t.riding && pl > 0.3 ? 2.6 * this.zoom : 0;
-        this.shoreShift = snap ? shiftTarget : this.shoreShift + (shiftTarget - this.shoreShift) * (1 - Math.exp(-dt / 0.8));
-        if (pl > 1e-3) {
-          px /= pl;
-          pz /= pl;
-          this.desired.x += px * this.shoreShift;
-          this.desired.z += pz * this.shoreShift;
+        if (rb > 1e-3) {
+          // riding: low over the water in front of the face (looking up at the rider and the lip),
+          // never far below the rider
+          const water = this.ocean.heightAt(this.desired.x, this.desired.z);
+          const low = Math.max(water + RIDE_VIEW.height * Math.sqrt(this.zoom), this.focus.y - 1.6) + this.pitchOffset * dist;
+          this.desired.y += (low - this.desired.y) * rb;
         }
         this.moveTo(this.desired, snap ? 1 : 1 - Math.exp(-dt / 0.1));
-        this.look.copy(this.focus).addScaledVector(this.tmp.set(cy, 0, sy), standing ? 2.2 : 1.4);
-        this.look.y += 0.35;
+        this.look.copy(this.focus).addScaledVector(this.tmp.set(cy, 0, sy), (standing ? 2.2 : 1.4) + 0.6 * rb);
+        this.look.y += 0.35 + 0.25 * rb;
         break;
       }
       case 'orbit': {

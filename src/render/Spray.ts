@@ -6,15 +6,25 @@
  * lean, refined once with the crest's local state), the breaking state of the crest and of the
  * roller just ahead of it gates visibility, and the particle follows a ballistic
  * path with drag relative to where the crest was when it was "spawned" (the crest has since moved
- * on at the phase speed, so droplets thrown off the lip fall behind it). Two populations: fine
- * droplets thrown off the lip, and soft mist puffs hanging over the roller. Lighting: sun with a
- * strong forward-scattering lobe (backlit spray glows) plus sky irradiance.
+ * on at the phase speed, so droplets thrown off the lip fall behind it); the crest point includes
+ * the render-only breaker geometry (thrown lip, roller mound: shaders/breaker.ts). Two
+ * populations: fine droplets thrown off the lip, and soft mist puffs hanging over the roller.
+ * Lighting (per vertex: a sprite is small): sun with a strong forward-scattering lobe (backlit
+ * spray glows) plus sky irradiance, aerial perspective.
+ *
+ * Cost: particles whose seed sits in small, unbroken water (lulls, outside the sets) are dropped
+ * after one swell evaluation; mist puffs are capped at 64 px (large sprites pop at the screen
+ * edge — points are clipped by their centre — and cost overdraw).
  */
 import * as THREE from 'three';
 import { mulberry32 } from '../ocean/waveModel';
 import { OCEAN_GLSL, type OceanShaderData } from '../ocean/waveGLSL';
 import type { Environment } from './Environment';
+import { BREAKER_GLSL } from './shaders/breaker';
 import { ENV_GLSL, NOISE_GLSL } from './shaders/common';
+
+/** Spray draws after every other transparent object (board underwater pass 20, rider 30). */
+export const SPRAY_RENDER_ORDER = 40;
 
 export interface SprayRegion {
   xMin: number;
@@ -45,6 +55,9 @@ export interface SprayOptions {
 
 const SPRAY_VERTEX = /* glsl */ `
 ${OCEAN_GLSL}
+${NOISE_GLSL}
+${ENV_GLSL}
+${BREAKER_GLSL}
 attribute vec4 aSeed;        // seed x, seed z, random, random
 attribute vec2 aRand;        // random, kind (0 droplet, 1 lip spray, 2 mist)
 uniform float uTime;
@@ -54,6 +67,7 @@ uniform float uIntensity;
 varying float vAlpha;
 varying float vKind;
 varying vec3 vWorld;
+varying vec3 vColor;
 
 void main() {
   float kind = aRand.y;
@@ -66,6 +80,16 @@ void main() {
   // Wavenumber and lean change a lot toward a breaking crest (shoaling), so the first estimate
   // from the seed's own state lands a few metres short; one step with the local state fixes it.
   OceanSwell s0 = oceanSwell(aSeed.xy);
+  if (s0.height < 0.3 && s0.breaking < 0.005) {
+    // small unbroken water (a lull): nothing breaks near this seed
+    vAlpha = 0.0;
+    vKind = kind;
+    vWorld = vec3(0.0);
+    vColor = vec3(0.0);
+    gl_PointSize = 1.0;
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
   float d = uOceanParams1.w;
   float phi0 = s0.psi + s0.skew * (cos(s0.psi - d) - cos(-d));
   vec2 anchor = aSeed.xy - s0.dir * (phi0 / max(s0.k, 0.01));
@@ -86,7 +110,7 @@ void main() {
   float H = s.height;
   vec3 dir = vec3(s.dir.x, 0.0, s.dir.y);
   vec3 side = vec3(-s.dir.y, 0.0, s.dir.x);
-  vec3 base = vec3(anchor.x, s.eta, anchor.y) + side * (r3 - 0.5) * 1.5;
+  vec3 base = vec3(anchor.x, s.eta, anchor.y) + side * (r3 - 0.5) * 1.5 + breakerOffset(s, anchor, uTime, 0.25);
   vec3 pos;
   float size;
   float alpha;
@@ -118,17 +142,27 @@ void main() {
   float px = size * uPixelScale / max(-mv.z, 0.1);
   // sub-pixel particles keep 1.5 px and fade instead of shrinking (no shimmering)
   vAlpha *= clamp(px / 1.5, 0.0, 1.0);
-  gl_PointSize = clamp(px, 1.5, 256.0);
-  if (vAlpha < 0.002) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+  gl_PointSize = clamp(px, 1.5, kind > 1.5 ? 64.0 : 128.0);
+  if (vAlpha < 0.002) {
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    vColor = vec3(0.0);
+    return;
+  }
+  // lighting: forward-scattering lobe (Henyey-Greenstein g = 0.75) + isotropic part, haze
+  vec3 V = normalize(cameraPosition - pos);
+  float cosT = dot(-V, uSunDirection);
+  float g = 0.75;
+  float hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cosT, 1.5) / (4.0 * 3.14159265);
+  vColor = applyHaze(uSunColor * (0.1 + hg * 1.1) * 0.9 + uSkyIrradiance * 0.32, pos, cameraPosition);
 }
 `;
 
 const SPRAY_FRAGMENT = /* glsl */ `
 ${NOISE_GLSL}
-${ENV_GLSL}
 varying float vAlpha;
 varying float vKind;
 varying vec3 vWorld;
+varying vec3 vColor;
 void main() {
   vec2 c = gl_PointCoord * 2.0 - 1.0;
   float r2 = dot(c, c);
@@ -137,14 +171,7 @@ void main() {
   float soft = vKind > 1.5 ? (exp(-3.5 * r2) - 0.03) * (0.7 + 0.3 * vnoise(c * 1.7 + vWorld.xz * 0.7))
              : vKind > 0.5 ? pow(1.0 - r2, 1.5) * (0.4 + 0.6 * smoothstep(0.15, 0.85, vnoise(c * 1.8 + vWorld.xz * 2.3)))
              : smoothstep(1.0, 0.4, r2);
-  vec3 V = normalize(cameraPosition - vWorld);
-  float cosT = dot(-V, uSunDirection);
-  // forward-scattering lobe (Henyey-Greenstein g = 0.75) + isotropic part
-  float g = 0.75;
-  float hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cosT, 1.5) / (4.0 * 3.14159265);
-  vec3 col = uSunColor * (0.1 + hg * 1.1) * 0.9 + uSkyIrradiance * 0.32;
-  col = applyHaze(col, vWorld, cameraPosition);
-  gl_FragColor = vec4(col, vAlpha * soft);
+  gl_FragColor = vec4(vColor, vAlpha * soft);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }
@@ -204,7 +231,10 @@ export class Spray {
     this.object3d = new THREE.Points(geo, this.material);
     this.object3d.name = 'spray';
     this.object3d.frustumCulled = false;
-    this.object3d.renderOrder = 10;
+    // last in the transparent queue (after the board's underwater pass, 20, and the rider,
+    // RIDER_RENDER_ORDER 30, which write colour over whatever was blended before them): spray
+    // writes no depth, and still depth-tests against the rider, so only spray in front shows
+    this.object3d.renderOrder = SPRAY_RENDER_ORDER;
   }
 
   get intensity(): number {

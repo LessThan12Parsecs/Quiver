@@ -64,34 +64,17 @@ export class ImplicitSystem {
    * (the velocity of the board point along n is J·u).
    */
   addBoardDamping(nx: number, ny: number, nz: number, rx: number, ry: number, rz: number, c: number): void {
-    if (!(c > 0)) return;
-    const j0 = nx, j1 = ny, j2 = nz;
-    const j3 = ry * nz - rz * ny;
-    const j4 = rz * nx - rx * nz;
-    const j5 = rx * ny - ry * nx;
-    const C = this.C;
-    C[0] += c * j0 * j0; C[1] += c * j0 * j1; C[2] += c * j0 * j2; C[3] += c * j0 * j3; C[4] += c * j0 * j4; C[5] += c * j0 * j5;
-    C[10] += c * j1 * j1; C[11] += c * j1 * j2; C[12] += c * j1 * j3; C[13] += c * j1 * j4; C[14] += c * j1 * j5;
-    C[20] += c * j2 * j2; C[21] += c * j2 * j3; C[22] += c * j2 * j4; C[23] += c * j2 * j5;
-    C[30] += c * j3 * j3; C[31] += c * j3 * j4; C[32] += c * j3 * j5;
-    C[40] += c * j4 * j4; C[41] += c * j4 * j5;
-    C[50] += c * j5 * j5;
+    if (c > 0) addBoardRank1(this.C, nx, ny, nz, rx, ry, rz, c);
+  }
+
+  /** Stiffness k along unit direction n at board offset r (a spring on that board point): K += k·J Jᵀ. */
+  addBoardStiffness(nx: number, ny: number, nz: number, rx: number, ry: number, rz: number, k: number): void {
+    if (k > 0) addBoardRank1(this.K, nx, ny, nz, rx, ry, rz, k);
   }
 
   /** Rank-1 mass m along unit direction n at board offset r (added mass): M += m·J Jᵀ. */
   addBoardMass(nx: number, ny: number, nz: number, rx: number, ry: number, rz: number, m: number): void {
-    if (!(m > 0)) return;
-    const j0 = nx, j1 = ny, j2 = nz;
-    const j3 = ry * nz - rz * ny;
-    const j4 = rz * nx - rx * nz;
-    const j5 = rx * ny - ry * nx;
-    const M = this.M;
-    M[0] += m * j0 * j0; M[1] += m * j0 * j1; M[2] += m * j0 * j2; M[3] += m * j0 * j3; M[4] += m * j0 * j4; M[5] += m * j0 * j5;
-    M[10] += m * j1 * j1; M[11] += m * j1 * j2; M[12] += m * j1 * j3; M[13] += m * j1 * j4; M[14] += m * j1 * j5;
-    M[20] += m * j2 * j2; M[21] += m * j2 * j3; M[22] += m * j2 * j4; M[23] += m * j2 * j5;
-    M[30] += m * j3 * j3; M[31] += m * j3 * j4; M[32] += m * j3 * j5;
-    M[40] += m * j4 * j4; M[41] += m * j4 * j5;
-    M[50] += m * j5 * j5;
+    if (m > 0) addBoardRank1(this.M, nx, ny, nz, rx, ry, rz, m);
   }
 
   /** Isotropic damping c on the board's angular velocity. */
@@ -106,6 +89,17 @@ export class ImplicitSystem {
     this.C[60] += c;
     this.C[70] += c;
     this.C[80] += c;
+  }
+
+  /** Damping kd and stiffness ks on the rider along unit axis a (rider-only: ground contact). */
+  addRiderSpring(ax: number, ay: number, az: number, kd: number, ks: number): void {
+    const C = this.C, K = this.K;
+    C[60] += kd * ax * ax; C[61] += kd * ax * ay; C[62] += kd * ax * az;
+    C[70] += kd * ay * ay; C[71] += kd * ay * az;
+    C[80] += kd * az * az;
+    K[60] += ks * ax * ax; K[61] += ks * ax * ay; K[62] += ks * ax * az;
+    K[70] += ks * ay * ay; K[71] += ks * ay * az;
+    K[80] += ks * az * az;
   }
 
   /**
@@ -193,4 +187,18 @@ export class ImplicitSystem {
     }
     return du;
   }
+}
+
+/** A += s·J Jᵀ (upper triangle of the board block) with J = [n, r × n]. */
+function addBoardRank1(A: Float64Array, nx: number, ny: number, nz: number, rx: number, ry: number, rz: number, s: number): void {
+  const j0 = nx, j1 = ny, j2 = nz;
+  const j3 = ry * nz - rz * ny;
+  const j4 = rz * nx - rx * nz;
+  const j5 = rx * ny - ry * nx;
+  A[0] += s * j0 * j0; A[1] += s * j0 * j1; A[2] += s * j0 * j2; A[3] += s * j0 * j3; A[4] += s * j0 * j4; A[5] += s * j0 * j5;
+  A[10] += s * j1 * j1; A[11] += s * j1 * j2; A[12] += s * j1 * j3; A[13] += s * j1 * j4; A[14] += s * j1 * j5;
+  A[20] += s * j2 * j2; A[21] += s * j2 * j3; A[22] += s * j2 * j4; A[23] += s * j2 * j5;
+  A[30] += s * j3 * j3; A[31] += s * j3 * j4; A[32] += s * j3 * j5;
+  A[40] += s * j4 * j4; A[41] += s * j4 * j5;
+  A[50] += s * j5 * j5;
 }

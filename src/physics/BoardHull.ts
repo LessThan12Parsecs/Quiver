@@ -738,10 +738,15 @@ export class BoardHull {
         const fn = Math.max(a * (H.seabedStiffness * pen - H.seabedDamping * vry), 0);
         const vtx = vx0 + wy * rbz - wz * rby;
         const vtz = vz0 + wx * rby - wy * rbx;
-        const vt = Math.sqrt(vtx * vtx + vtz * vtz) + 0.05;
-        const ff = (H.seabedFriction * fn) / vt;
+        // Coulomb friction, regularised below ≈ 5 cm/s. It is a damper of μ·fn/(|v_t| + 0.05)
+        // (≈ 8000 N·s/m under a standing rider), far past the explicit limit on a 3–6 kg board, so
+        // it goes into the implicit damping too (explicitly it chattered back and forth)
+        const ff = (H.seabedFriction * fn) / (Math.sqrt(vtx * vtx + vtz * vtz) + 0.05);
         sys.addBoardForce(-vtx * ff, fn, -vtz * ff, rbx, rby, rbz);
         sys.addBoardDamping(0, 1, 0, rbx, rby, rbz, a * H.seabedDamping);
+        sys.addBoardDamping(1, 0, 0, rbx, rby, rbz, ff);
+        sys.addBoardDamping(0, 0, 1, rbx, rby, rbz, ff);
+        if (fn > 0) sys.addBoardStiffness(0, 1, 0, rbx, rby, rbz, a * H.seabedStiffness);
         diag.seabed.x -= vtx * ff;
         diag.seabed.y += fn;
         diag.seabed.z -= vtz * ff;

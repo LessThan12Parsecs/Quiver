@@ -1,11 +1,14 @@
 /**
  * DOM HUD (markup and styles live in index.html): speed, stance, board, sunk volume, wave state
  * under the board, attitude, a balance dial (ankle torque / what the feet can hold, roll → x,
- * pitch → y; the dashed ring is the slip limit), riding badge + ride timer, wipeout messages,
- * hints and a status line. Text refreshes at ~10 Hz, the balance dot every frame.
+ * pitch → y; the dashed ring is the slip limit), a badge (CAUGHT while prone and the board runs
+ * with the wave — the moment to pop up; RIDING + timer while standing on a wave), ride timer,
+ * wipeout messages (the advice follows how the rider fell), hints and a status line. Text
+ * refreshes at ~10 Hz, the balance dot every frame. Rides are the game's (standing) rides, see
+ * Game.stepOnce — not `telemetry.riding`, which also counts prone belly rides and lone boards.
  */
 import type { SurfTelemetry } from '../physics/SurfSim';
-import type { WipeoutReason } from '../physics/Rider';
+import type { Rider, WipeoutReason } from '../physics/Rider';
 
 export interface HudInfo {
   boardName: string;
@@ -14,9 +17,16 @@ export interface HudInfo {
   timeScale: number;
   paused: boolean;
   camera: string;
+  /** Standing on a wave right now, and for how long (s). */
+  riding: boolean;
+  rideTime: number;
+  /** Prone and the board runs with the wave (pop-up cue). */
+  caught: boolean;
   /** Rides: last finished and best this session, s. */
   lastRide: number;
   bestRide: number;
+  /** Which way the body went over in a balance wipeout. */
+  tipOver: Rider['tipOver'];
   gamepad: boolean;
   /** Real-time factor actually achieved (sim seconds per real second / time scale). */
   simLoad: number;
@@ -25,11 +35,20 @@ export interface HudInfo {
 }
 
 const WIPEOUT_TEXT: Record<WipeoutReason, [string, string]> = {
-  balance: ['Lost your balance', 'you leaned further than the turn could hold and tipped over your feet — keep the dot in the ring'],
+  balance: ['Lost your balance', 'the board rolled further than your feet could hold — ease off the rail (A/D) and keep the dot in the ring'],
   flipped: ['Board flipped', 'rolled past the rail'],
   pearl: ['Pearled', 'the nose dug in — weight back on steep drops'],
   buried: ['Buried', 'the board went too deep'],
   impact: ['Slammed', 'the legs could not absorb the impact'],
+};
+
+/** Balance wipeouts by the direction the body went over (the generic text above is 'side'). */
+const BALANCE_TEXT: Record<'forward' | 'back', [string, string]> = {
+  back: [
+    'Fell off the back',
+    'the board stalled under you (the wave passed or the whitewater stopped it) — pop up only once it runs with the wave (CAUGHT), weight forward (W)',
+  ],
+  forward: ['Thrown over the nose', 'the board dropped away under you — weight back (S) on steep drops'],
 };
 
 function el<T extends HTMLElement = HTMLElement>(id: string): T {
@@ -66,7 +85,10 @@ export class Hud {
   private lastText = -1;
   private lastStance = '';
   private flashUntil = 0;
+  /** The message shown is the wipeout message (cleared when the rider is back up). */
+  private showingWipeout = false;
   private hintText = '';
+  private badge = '';
 
   /** Show/hide the controls panel. */
   get helpVisible(): boolean {
@@ -84,6 +106,7 @@ export class Hud {
     this.message.classList.add('on');
     this.message.classList.remove('bad');
     this.flashUntil = now + seconds;
+    this.showingWipeout = false;
   }
 
   /** Bottom hint line (null hides it). */
@@ -110,14 +133,19 @@ export class Hud {
     // messages: wipeouts persist until the stance changes; flashes time out
     if (t.stance !== this.lastStance) {
       if (t.stance === 'fallen' && t.wipeoutReason) {
-        const [big, small] = WIPEOUT_TEXT[t.wipeoutReason];
+        const tip = info.tipOver;
+        const [big, small] =
+          t.wipeoutReason === 'balance' && (tip === 'back' || tip === 'forward') ? BALANCE_TEXT[tip] : WIPEOUT_TEXT[t.wipeoutReason];
         this.messageBig.textContent = `Wipeout — ${big}`;
-        this.messageSmall.textContent = `${small}.  R: back to the lineup · T: next wave`;
+        this.messageSmall.textContent = `${small}.\nR: back to the lineup · T: next wave`;
         this.message.classList.add('on', 'bad');
         this.flashUntil = Infinity;
-      } else if (this.lastStance === 'fallen') {
+        this.showingWipeout = true;
+      } else if (this.lastStance === 'fallen' && this.showingWipeout) {
+        // (a flash shown since, e.g. T's "Drop in!", keeps its own timeout)
         this.message.classList.remove('on', 'bad');
         this.flashUntil = 0;
+        this.showingWipeout = false;
       }
       this.lastStance = t.stance;
       this.lastText = -1;
@@ -126,7 +154,14 @@ export class Hud {
       this.message.classList.remove('on');
       this.flashUntil = 0;
     }
-    this.ride.classList.toggle('on', t.riding);
+    const badge = info.riding ? 'riding' : info.caught ? 'caught' : '';
+    if (badge !== this.badge) {
+      this.badge = badge;
+      this.ride.classList.toggle('on', badge !== '');
+      this.ride.classList.toggle('caught', badge === 'caught');
+      if (badge === 'caught') this.ride.textContent = 'CAUGHT — POP UP';
+      this.lastText = -1;
+    }
 
     if (now - this.lastText < 0.1) return;
     this.lastText = now;
@@ -143,12 +178,12 @@ export class Hud {
     setBar(this.fullnessBar, w.fullness, w.breaking > 0.2 ? '#ffffff' : w.fullness > 0.8 ? 'var(--warn)' : 'var(--accent)');
     this.water.textContent = `${w.depth.toFixed(1)} m · deck ${deckText(t.deckDepth)}`;
     this.attitude.textContent = `${deg(t.pitchRad)} pitch ${deg(t.rollRad)} roll${t.finStalled ? ' · fin STALL' : ''}`;
-    this.rideTime.textContent = t.riding
-      ? `${t.ridingTime.toFixed(1)} s`
+    this.rideTime.textContent = info.riding
+      ? `${info.rideTime.toFixed(1)} s`
       : info.bestRide > 0
         ? `last ${info.lastRide.toFixed(1)} s · best ${info.bestRide.toFixed(1)} s`
         : '—';
-    this.ride.textContent = `RIDING  ${t.ridingTime.toFixed(1)} s`;
+    if (badge === 'riding') this.ride.textContent = `RIDING  ${info.rideTime.toFixed(1)} s`;
     this.balancePanel.classList.toggle('off', !standing);
     this.balanceValue.textContent = standing ? `${(t.balance * 100).toFixed(0)} %` : '—';
     this.balanceDetail.textContent = standing

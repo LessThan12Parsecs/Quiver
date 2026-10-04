@@ -15,10 +15,19 @@
  * When paused, frames are rendered only after something changed (cheap when idle, and headless
  * screenshots need an idle compositor); `ready` turns true when no render is pending.
  *
+ * Rides (HUD badge + timer, last/best, follow-cam framing) and the "caught" pop-up cue are the
+ * game's own notion (RideTracker: standing on a wave; telemetry.riding alone also holds for prone
+ * belly rides and riderless boards).
+ *
+ * WebGL context loss: three.js restores the context, but render-target contents are gone; on
+ * 'webglcontextrestored' the environment map and the ripple tiles are regenerated.
+ *
  * URL parameters (parseGameParams): spawn=lineup|wave, side=1|-1|0 (wave side, 0 = automatic),
  * cam=follow|orbit|beach|side, board=shortboard|funboard|longboard|softtop, t=<start time s>,
- * paused=1, scale=<time scale>, q=low|medium|high|ultra|<number>, dpr=<max pixel ratio>,
- * mass=<rider kg>, assist=<0..1>, spray=<intensity, 0 = off>, forces=1, probes=1, gui=0,
+ * paused=1, scale=<time scale>, q=low|medium|high|ultra|<number>, dpr=<max pixel ratio> (default
+ * by quality: low 1, medium 1.25, otherwise 1.5),
+ * mass=<rider kg>, assist=<0..1> (balance reflex strength, 0.85 = tuned; more is not easier),
+ * spray=<intensity, 0 = off>, forces=1, probes=1, gui=0,
  * help=0, clean=1 (no HUD/GUI), shadows=0, xray=0, autopilot=1 (start with the autopilot on).
  */
 import * as THREE from 'three';
@@ -28,11 +37,12 @@ import { OceanShaderData } from '../ocean/waveGLSL';
 import { BOARD_PRESETS, type BoardPresetId } from '../physics/boardShape';
 import { PHYSICS_DT } from '../physics/constants';
 import { type RiderPose } from '../physics/Rider';
-import { Autopilot } from '../physics/autopilot';
+import { Autopilot, DEFAULT_AUTOPILOT } from '../physics/autopilot';
 import { lineupSpawn, waveSpawn } from '../physics/spawn';
 import { SurfSim, type SurfInput } from '../physics/SurfSim';
 import { BeachMesh } from '../render/BeachMesh';
 import { BoardMesh } from '../render/BoardMesh';
+import { BoardWake } from '../render/BoardWake';
 import { Environment } from '../render/Environment';
 import { OceanMesh, type OceanQuality } from '../render/OceanMesh';
 import { RiderMesh } from '../render/RiderMesh';
@@ -42,6 +52,7 @@ import { DEFAULT_START_TIME, MAX_SUBSTEPS, TIME_SCALES, type SpawnSide } from '.
 import { DebugDraw } from './DebugDraw';
 import { DebugGui } from './DebugGui';
 import { Hud } from './Hud';
+import { RideTracker } from './RideTracker';
 import { Input, type GameAction } from './Input';
 
 export { DEFAULT_START_TIME, MAX_SUBSTEPS, TIME_SCALES, type SpawnSide } from './constants';
@@ -94,12 +105,12 @@ export function parseGameParams(q: URLSearchParams): GameParams {
     spawn: q.get('spawn') === 'wave' ? 'wave' : 'lineup',
     side: side > 0 ? 1 : side < 0 ? -1 : 0,
     cam: CAMERA_MODES.includes(cam) ? cam : 'follow',
-    board: board in BOARD_PRESETS ? board : 'funboard',
+    board: Object.hasOwn(BOARD_PRESETS, board) ? board : 'funboard',
     t: num('t', DEFAULT_START_TIME),
     paused: flag('paused', false),
     timeScale: Math.min(Math.max(num('scale', 1), 1 / 64), 4),
     quality,
-    dpr: Math.min(Math.max(num('dpr', 1.5), 0.25), 3),
+    dpr: Math.min(Math.max(num('dpr', quality === 'low' ? 1 : quality === 'medium' ? 1.25 : 1.5), 0.25), 3),
     riderMass: Math.min(Math.max(num('mass', 75), 40), 130),
     balanceAssist: q.has('assist') ? Math.min(Math.max(num('assist', 0.85), 0), 1) : null,
     spray: Math.max(num('spray', 1), 0),
@@ -131,8 +142,13 @@ export interface QuiverState {
   rollDeg: number;
   submergedLiters: number;
   deckDepth: number;
+  /** telemetry.riding: the board moves with a wave (any stance, rider or not). */
   riding: boolean;
   ridingTime: number;
+  /** The game's ride: standing on a wave, seconds so far (0 = not riding). */
+  ride: number;
+  /** Prone and the board runs with the wave (the pop-up cue). */
+  caught: boolean;
   wipeoutReason: string | null;
   waveHeight: number;
   fullness: number;
@@ -202,6 +218,8 @@ export class Game {
   readonly sim: SurfSim;
   boardMesh: BoardMesh;
   readonly riderMesh: RiderMesh;
+  /** Rail spray, wake and splashes of the board/rider. */
+  readonly boardWake: BoardWake;
   readonly input: Input;
   readonly cameraRig: CameraRig;
   readonly hud: Hud;
@@ -215,9 +233,8 @@ export class Game {
   private lastSpawnSide: 1 | -1 = 1;
   /** The scripted surfer driving the inputs (O), or null when the player is in control. */
   autopilot: Autopilot | null = null;
-  /** Seconds of the last finished ride / the best ride this session. */
-  lastRide = 0;
-  bestRide = 0;
+  /** Standing rides (current, last, best) and the pop-up cue. */
+  readonly rides = new RideTracker();
   readonly stats = {
     fps: 0,
     frameMs: 0,
@@ -255,7 +272,8 @@ export class Game {
   private fpsN = 0;
   private loadReq = 0;
   private loadDone = 0;
-  private lastRidingTime = 0;
+  /** Height of a set wave approaching from behind (prone), 0 = none (per rendered frame). */
+  private setBehind = 0;
   private hintTimer = 0;
   private renderResolvers: Array<() => void> = [];
   private readonly sample = createSurfaceSample();
@@ -267,6 +285,17 @@ export class Game {
   private readonly tmpQ = new THREE.Quaternion();
   private readonly tmpV = new THREE.Vector3();
   private readonly onResize = (): void => this.resize();
+  private readonly onContextLost = (): void => {
+    console.warn('[quiver] WebGL context lost');
+    this.hud.flash('Graphics context lost', 'waiting for the GPU to come back…', 3600, performance.now() / 1000);
+  };
+  /** three.js re-creates GL objects, but render targets come back empty: regenerate them. */
+  private readonly onContextRestored = (): void => {
+    this.env.restoreContext(); // PMREM: water sky reflection + scene.environment
+    this.oceanMesh.invalidateDetail(); // ripple tiles (not redrawn while the time stands still)
+    this.hud.flash('Graphics restored', '', 1.2, performance.now() / 1000);
+    this.requestRender(3);
+  };
 
   constructor(container: HTMLElement, params: GameParams) {
     this.params = params;
@@ -333,6 +362,8 @@ export class Game {
     this.scene.add(this.boardMesh.object3d);
     this.riderMesh = new RiderMesh();
     this.scene.add(this.riderMesh.object3d);
+    this.boardWake = new BoardWake(this.env);
+    this.scene.add(this.boardWake.object3d);
     this.renderPose = clonePose(this.sim.rider.pose);
     this.camTarget = {
       position: this.renderPos,
@@ -342,6 +373,7 @@ export class Game {
       stance: 'prone',
       waveDir: new THREE.Vector3(1, 0, 0),
       riding: false,
+      lookBack: false,
     };
 
     // --- game shell
@@ -364,6 +396,8 @@ export class Game {
       if (e.buttons) this.requestRender();
     });
     renderer.domElement.addEventListener('wheel', () => this.requestRender(), { passive: true });
+    renderer.domElement.addEventListener('webglcontextlost', this.onContextLost);
+    renderer.domElement.addEventListener('webglcontextrestored', this.onContextRestored);
     window.addEventListener('keydown', () => this.requestRender());
     this.cameraRig.controls.addEventListener('change', () => this.requestRender());
 
@@ -397,12 +431,15 @@ export class Game {
   dispose(): void {
     this.stop();
     window.removeEventListener('resize', this.onResize);
+    this.renderer.domElement.removeEventListener('webglcontextlost', this.onContextLost);
+    this.renderer.domElement.removeEventListener('webglcontextrestored', this.onContextRestored);
     this.gui?.dispose();
     this.input.dispose();
     this.cameraRig.dispose();
     this.debugDraw.dispose();
     this.boardMesh.dispose();
     this.riderMesh.dispose();
+    this.boardWake.dispose();
     this.spray?.dispose();
     this.beach?.dispose();
     this.oceanMesh.dispose();
@@ -575,6 +612,8 @@ export class Game {
       deckDepth: t.deckDepth,
       riding: t.riding,
       ridingTime: t.ridingTime,
+      ride: this.rides.time,
+      caught: this.rides.caught,
       wipeoutReason: t.wipeoutReason,
       waveHeight: t.water.waveHeight,
       fullness: t.water.fullness,
@@ -654,7 +693,9 @@ export class Game {
     this.prevRider.copy(this.sim.rider.position);
     this.prevTime = this.sim.time;
     this.acc = 0;
-    this.lastRidingTime = 0;
+    // a ride in progress counts (pressing R/T or swapping boards mid-ride)
+    this.rides.teleport();
+    this.boardWake.reset();
     this.input.consumeEdges();
     this.cameraRig.snap();
     this.requestRender(3);
@@ -672,13 +713,7 @@ export class Game {
     sim.step(PHYSICS_DT, this.input.surf);
     this.input.consumeEdges();
     if (resetting) this.afterTeleport();
-    // ride bookkeeping
-    const rt = sim.telemetry.ridingTime;
-    if (rt === 0 && this.lastRidingTime > 0.5) {
-      this.lastRide = this.lastRidingTime;
-      this.bestRide = Math.max(this.bestRide, this.lastRide);
-    }
-    this.lastRidingTime = rt;
+    else this.rides.update(sim);
     if (!this.physicsFinite()) {
       console.error('[quiver] non-finite physics state; resetting at the lineup');
       this.resetLineup();
@@ -782,7 +817,9 @@ export class Game {
     // --- camera (needs the ocean at the render time: stays above the surface)
     const ct = this.camTarget;
     ct.stance = rider.stance;
-    ct.riding = sim.telemetry.riding;
+    ct.riding = this.rides.riding;
+    this.setBehind = rider.stance === 'prone' ? this.setWaveBehind() : 0;
+    ct.lookBack = this.setBehind > 0 && !this.rides.caught;
     ct.waveDir.set(s.dirX, 0, s.dirZ);
     this.cameraRig.update(camDt, ct);
 
@@ -794,9 +831,12 @@ export class Game {
 
     // --- world
     this.env.update(this.camera);
-    this.oceanMesh.update(this.camera, this.renderTime);
+    const cp = this.camera.position;
+    this.oceanMesh.update(this.camera, this.renderTime, this.ocean.heightAt(cp.x, cp.z));
     this.beach?.update(this.camera, this.renderTime);
-    this.spray?.update(this.camera, this.renderTime, this.renderer.getDrawingBufferSize(this.drawSize).y);
+    const viewH = this.renderer.getDrawingBufferSize(this.drawSize).y;
+    this.spray?.update(this.camera, this.renderTime, viewH);
+    this.boardWake.update(sim, this.ocean, this.renderPos, this.renderQuat, s, this.renderTime, this.camera, viewH);
     this.debugDraw.update();
 
     this.renderer.render(this.scene, this.camera);
@@ -820,8 +860,12 @@ export class Game {
         timeScale: this.timeScale,
         paused: this.paused,
         camera: this.cameraRig.mode,
-        lastRide: this.lastRide,
-        bestRide: this.bestRide,
+        riding: this.rides.riding,
+        rideTime: this.rides.time,
+        caught: this.rides.caught,
+        lastRide: this.rides.lastRide,
+        bestRide: this.rides.bestRide,
+        tipOver: rider.tipOver,
         gamepad: this.input.gamepadActive,
         simLoad: st.simLoad,
         autopilot: this.autopilot ? this.autopilot.status.phase : null,
@@ -877,7 +921,36 @@ export class Game {
     dst.forward.copy(src.forward).applyQuaternion(this.tmpQ);
   }
 
-  /** Context hints at the bottom (prone at the lineup: when a set is coming). */
+  /**
+   * A set wave coming from behind: the height of the next crest seaward of the board if it is
+   * within SET_RANGE and a set wave (> the autopilot's minHeight, 1.15 m), else 0. Evaluated at
+   * the ocean's current time (call after the render-time setTime).
+   */
+  private setWaveBehind(): number {
+    const p = this.renderPos;
+    const se = this.ocean.evalSwell(p.x, p.z, this.waveProbe);
+    if (se.height < 0.3 || se.domK <= 0) return 0;
+    // waveform phase falls as a wave goes by: the next crest is (psi mod 2π) / k seaward
+    const ahead = (((se.domPsi % TWO_PI) + TWO_PI) % TWO_PI) / se.domK;
+    if (ahead > SET_RANGE) return 0;
+    const dx = se.domDirX;
+    const dz = se.domDirZ;
+    const h = this.ocean.evalSwell(p.x - dx * ahead, p.z - dz * ahead, this.waveProbe).height;
+    return h > DEFAULT_AUTOPILOT.minHeight ? h : 0;
+  }
+
+  /**
+   * Take-off spot for the hints: where the autopilot sits (x ≈ −38, ≈ 5 m outside where the sets
+   * break, 5 m beside the peak), kept relative to the bar crest when the bar is moved (GUI).
+   */
+  private takeoffSpot(): [number, number] {
+    const bar = this.ocean.config.bathymetry.bar;
+    const x = bar.x0 + (DEFAULT_AUTOPILOT.takeoffX - DEFAULT_OCEAN_CONFIG.bathymetry.bar.x0);
+    const side = this.renderPos.z >= 0 ? 1 : -1;
+    return [x, side * DEFAULT_AUTOPILOT.takeoffZ];
+  }
+
+  /** Context hints at the bottom (prone: where to wait, when a set is coming, when to pop up). */
   private updateHint(now: number): void {
     if (now - this.hintTimer < 0.25) return;
     this.hintTimer = now;
@@ -888,21 +961,25 @@ export class Game {
       return;
     }
     if (st !== 'prone') {
-      this.hud.setHint(st === 'popping' || sim.telemetry.riding ? null : st === 'standing' ? 'Trim with W/S, carve with A/D, crouch with Shift' : null);
+      this.hud.setHint(st === 'popping' || this.rides.riding ? null : st === 'standing' ? 'Trim with W/S, carve with A/D, crouch with Shift' : null);
+      return;
+    }
+    if (this.rides.caught) {
+      this.hud.setHint('The board is running with the wave — pop up now (Space)');
       return;
     }
     const p = this.renderPos;
-    let big = 0;
-    const se = this.waveProbe;
-    for (const dx of [-12, -24, -36]) big = Math.max(big, this.ocean.evalSwell(p.x + dx, p.z, se).height);
-    // take-off zone: ≈ 40–50 m seaward of the bar crest near the peak (sets break at x ≈ −35)
-    const bar = this.ocean.config.bathymetry.bar;
-    const tx = bar.x0 - 25;
+    const [tx, tz] = this.takeoffSpot();
     const dx = tx - p.x;
-    const dist = Math.hypot(dx, p.z * 0.5);
-    if (big > 1.15 && dist < 15) this.hud.setHint('Set wave behind you — point at the beach and paddle hard (W); pop up (Space) when the board starts to run');
-    else if (dist >= 15) this.hud.setHint(`Paddle ${dx > 0 ? 'in' : 'back out'} ≈ ${Math.round(dist)} m to the take-off spot near the peak (W, steer A/D) · T drops you straight onto a wave`);
-    else this.hud.setHint('In the take-off zone — sit tight and watch for a set (it shows up behind you) · T drops you onto a wave');
+    const dz = tz - p.z;
+    const inZone = Math.abs(dx) < TAKEOFF_ZONE[0] && Math.abs(p.z) < TAKEOFF_ZONE[1];
+    const set = this.setBehind;
+    if (set > 0 && (inZone || (dx < 0 && dx > -12 && Math.abs(p.z) < 20)))
+      this.hud.setHint(`${set.toFixed(1)} m set wave behind you — point at the beach and paddle hard (W) as it reaches you; pop up (Space) when CAUGHT shows`);
+    else if (!inZone) {
+      const where = Math.abs(dx) >= TAKEOFF_ZONE[0] ? `${dx > 0 ? 'in' : 'back out'} ≈ ${Math.round(Math.abs(dx))} m` : `≈ ${Math.round(Math.abs(dz))} m along the beach`;
+      this.hud.setHint(`Paddle ${where} to the take-off spot, just outside where the sets break, beside the peak (W, steer A/D) · T drops you straight onto a wave`);
+    } else this.hud.setHint('In the take-off zone — sit and watch for a set (the camera looks back when one comes) · T drops you onto a wave');
   }
 
   private resize(): void {
@@ -983,6 +1060,12 @@ export class Game {
     return api;
   }
 }
+
+const TWO_PI = Math.PI * 2;
+/** An approaching set wave's crest within this distance behind the board: hint + look-back, m. */
+const SET_RANGE = 32;
+/** Half-size of the take-off zone around the take-off spot: across the bar (x) and |z|, m. */
+const TAKEOFF_ZONE = [5, 14] as const;
 
 const AUTOPILOT_HINT: Record<string, string> = {
   position: 'Autopilot: paddling to the take-off spot near the peak',

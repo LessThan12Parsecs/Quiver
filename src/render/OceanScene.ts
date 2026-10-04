@@ -37,6 +37,7 @@ export class OceanScene {
   readonly beach: BeachMesh | null;
   readonly spray: Spray | null;
   private readonly renderer: THREE.WebGLRenderer;
+  private readonly model: OceanModel;
   private readonly drawSize = new THREE.Vector2();
 
   constructor(
@@ -47,6 +48,7 @@ export class OceanScene {
     opts: OceanSceneOptions = {},
   ) {
     this.renderer = renderer;
+    this.model = model;
     this.env = new Environment(renderer, scene, opts.environment);
     const wind = model.config.wind;
     this.ocean = new OceanMesh(shaderData, this.env, {
@@ -71,7 +73,7 @@ export class OceanScene {
    */
   update(camera: THREE.PerspectiveCamera, time: number): void {
     this.env.update(camera);
-    this.ocean.update(camera, time);
+    this.ocean.update(camera, time, this.model.heightAt(camera.position.x, camera.position.z));
     this.beach?.update(camera, time);
     this.spray?.update(camera, time, this.renderer.getDrawingBufferSize(this.drawSize).y);
   }
