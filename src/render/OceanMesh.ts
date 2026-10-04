@@ -13,16 +13,65 @@
  *
  * Shading: see shaders/ocean.ts. The material's uniforms include the shared objects of
  * OceanShaderData.uniforms and Environment.uniforms (spread, so their per-frame updates apply).
+ * Short-wave detail normals come from two animated spectral ripple tiles (DetailNormals.ts),
+ * regenerated in `update` (offscreen pass on the environment's renderer) and sampled at three
+ * scales: 16 m (tile A), 4.2 m and 1.1 m (tile B), each rotated relative to the wind.
+ *
+ * Quality: `quality` sets the vertex density (CDLOD ranges); `shading` sets the fragment cost
+ * (detail layers, foam relief, face streaks, tile size / anisotropy). By default a quality preset
+ * also picks the matching shading level (low -> low, medium -> medium, high/ultra -> high).
  */
 import * as THREE from 'three';
 import { DEFAULT_OCEAN_CONFIG } from '../ocean/oceanConfig';
-import { mulberry32 } from '../ocean/waveModel';
 import type { OceanShaderData } from '../ocean/waveGLSL';
+import { RippleTile } from './DetailNormals';
 import type { Environment } from './Environment';
 import { CdlodSelector } from './cdlod';
-import { MAX_LODS, OCEAN_FRAGMENT, OCEAN_VERTEX, RIPPLE_COUNT } from './shaders/ocean';
+import { MAX_LODS, OCEAN_FRAGMENT, OCEAN_VERTEX } from './shaders/ocean';
 
 export type OceanQuality = 'low' | 'medium' | 'high' | 'ultra';
+
+/** Fragment shading level of the water. */
+export type OceanShading = 'low' | 'medium' | 'high';
+
+export interface OceanShadingPreset {
+  /** Detail-normal layers sampled (1-3); missing layers only add their slope variance to roughness. */
+  layers: 1 | 2 | 3;
+  /** Whitewater micro-relief (lumps, bubble domes). */
+  foamDetail: boolean;
+  /** Streaks on steep wave faces. */
+  faceDetail: boolean;
+  /** Ripple tile B (4.2 m; layers 1, 2, face streaks) resolution (texels) and wave components. */
+  tileSize: number;
+  components: number;
+  /** Tile A (16 m, layer 0; only with layers > 1): resolution and components. Its finest waves
+   * (16 m / (size / 4)) only need to reach into tile B's range. */
+  tileSizeA: number;
+  componentsA: number;
+  /** Anisotropic filtering of the tiles. */
+  anisotropy: number;
+}
+
+export const OCEAN_SHADING: Record<OceanShading, OceanShadingPreset> = {
+  low: { layers: 1, foamDetail: false, faceDetail: false, tileSize: 128, components: 64, tileSizeA: 0, componentsA: 0, anisotropy: 2 },
+  medium: { layers: 2, foamDetail: false, faceDetail: true, tileSize: 256, components: 96, tileSizeA: 128, componentsA: 64, anisotropy: 2 },
+  high: { layers: 3, foamDetail: true, faceDetail: true, tileSize: 256, components: 128, tileSizeA: 128, componentsA: 64, anisotropy: 4 },
+};
+
+const SHADING_FOR_QUALITY: Record<OceanQuality, OceanShading> = { low: 'low', medium: 'medium', high: 'high', ultra: 'high' };
+
+/**
+ * Detail-normal layers: which tile, world size (m), rotation from the wind direction (rad) and
+ * share of the total short-wave slope variance. Tile A spans 16 m (lambda 5.3 m - 50 cm at 128
+ * texels), tile B 4.2 m (1.4 m - 6.6 cm at 256 texels) and is reused at 1.1 m (37 cm - 1.7 cm)
+ * near the camera.
+ */
+const DETAIL_LAYERS = [
+  { tile: 0, size: 16, rotation: 0, share: 0.3 },
+  { tile: 1, size: 4.2, rotation: 0.41, share: 0.37 },
+  { tile: 1, size: 1.1, rotation: -0.67, share: 0.33 },
+] as const;
+const TILE_WORLD_SIZE = [16, 4.2];
 
 /** Range-to-node-size ratio of the near levels per quality preset (vertex density knob). */
 export const OCEAN_QUALITY_RATIO: Record<OceanQuality, number> = {
@@ -35,6 +84,8 @@ export const OCEAN_QUALITY_RATIO: Record<OceanQuality, number> = {
 export interface OceanMeshOptions {
   /** Preset name or the near-level range/size ratio directly (>= 2.2; higher = denser). */
   quality?: OceanQuality | number;
+  /** Fragment shading level (default: follows the quality preset; 'high' for numeric quality). */
+  shading?: OceanShading;
   /** Finest grid spacing in metres (<= 0.25 resolves steep faces). */
   finestSpacing?: number;
   /** Cells per patch side (power of two, >= 8). */
@@ -45,10 +96,14 @@ export interface OceanMeshOptions {
   maxDistance?: number;
   /** Vertical/horizontal culling margin for displaced waves (m). */
   maxWaveHeight?: number;
-  /** Wind direction (deg from +X toward +Z) and speed (m/s) for capillary ripples and gusts. */
+  /** Wind direction (deg from +X toward +Z) and speed (m/s) for detail ripples and gusts. */
   windDirectionDeg?: number;
   windSpeed?: number;
-  /** Total mean-square slope of the capillary ripples (Cox-Munk share below 1.2 m). */
+  /**
+   * Total mean-square slope of the short-wave detail normals (Cox-Munk share not carried by the
+   * geometric wind chop). Default scales with the wind speed (from uWindDrift, so live wind changes
+   * apply): 0.016 at 4 m/s.
+   */
   rippleSlopeVariance?: number;
 }
 
@@ -86,6 +141,9 @@ export class WaterLook {
   /** Base GGX alpha of the surface (before footprint-filtered slope variance). */
   get roughness(): number { return this.u.uRoughness.value as number; }
   set roughness(v: number) { this.u.uRoughness.value = v; }
+  /** Slope rms of the streaks running down steep wave faces. */
+  get faceStreaks(): number { return this.u.uFaceStreaks.value as number; }
+  set faceStreaks(v: number) { this.u.uFaceStreaks.value = v; }
 }
 
 const MAX_INSTANCES = 8192;
@@ -161,12 +219,13 @@ export class OceanMesh {
     return this.frustum.intersectsBox(this.box);
   };
 
-  // ripples
-  private readonly ripK = new Float64Array(RIPPLE_COUNT);
-  private readonly ripOmega = new Float64Array(RIPPLE_COUNT);
-  private readonly ripPhase0 = new Float64Array(RIPPLE_COUNT);
-  private readonly ripDir = new Float64Array(RIPPLE_COUNT * 2);
-  private readonly windDir = new THREE.Vector2();
+  // detail normals
+  private readonly renderer: THREE.WebGLRenderer;
+  private tiles: RippleTile[] = [];
+  private shadingLevel: OceanShading = 'high';
+  private readonly rippleMss: number | undefined;
+  private windAngle: number;
+  private readonly bufSize = new THREE.Vector2();
 
   constructor(shaderData: OceanShaderData, env: Environment, opts: OceanMeshOptions = {}) {
     this.lod = new CdlodSelector(
@@ -186,16 +245,12 @@ export class OceanMesh {
 
     const windDeg = opts.windDirectionDeg ?? DEFAULT_OCEAN_CONFIG.wind.directionDeg;
     const windSpeed = opts.windSpeed ?? DEFAULT_OCEAN_CONFIG.wind.speed;
-    this.windDir.set(Math.cos(THREE.MathUtils.degToRad(windDeg)), Math.sin(THREE.MathUtils.degToRad(windDeg)));
-    this.buildRipples(opts.rippleSlopeVariance ?? 0.012 * Math.min(Math.max(windSpeed / 4, 0.3), 2.5));
+    this.windAngle = THREE.MathUtils.degToRad(windDeg);
+    const windDir = new THREE.Vector2(Math.cos(this.windAngle), Math.sin(this.windAngle));
+    this.rippleMss = opts.rippleSlopeVariance;
+    this.renderer = env.renderer;
 
     const lodMorph = Array.from({ length: MAX_LODS }, () => new THREE.Vector2(1e9, 1));
-    const ripA = Array.from({ length: RIPPLE_COUNT }, () => new THREE.Vector4());
-    const ripAmp = Array.from({ length: RIPPLE_COUNT / 4 }, () => new THREE.Vector4());
-    for (let i = 0; i < RIPPLE_COUNT; i++) {
-      ripA[i].set(this.ripDir[i * 2], this.ripDir[i * 2 + 1], this.ripK[i], 0);
-      ripAmp[i >> 2].setComponent(i & 3, this.ripAmp[i]);
-    }
 
     this.material = new THREE.ShaderMaterial({
       name: 'OceanSurface',
@@ -205,10 +260,19 @@ export class OceanMesh {
         uLodOrigin: { value: new THREE.Vector3() },
         uLodMorph: { value: lodMorph },
         uTime: { value: 0 },
-        uRipA: { value: ripA },
-        uRipAmp: { value: ripAmp },
-        uRipOrigin: { value: new THREE.Vector2() },
-        uWindDrift: { value: this.windDir.clone().multiplyScalar(windSpeed * 0.5) },
+        uWindDrift: { value: windDir.clone().multiplyScalar(windSpeed * 0.5) },
+        uPixelAngle: { value: 0.0015 },
+        uDetail0: { value: null },
+        uDetail1: { value: null },
+        uDetailDecS: { value: new THREE.Vector4(1, 1, 1, 1) },
+        uDetailDecB: { value: new THREE.Vector4(0, 0, 0, 0) },
+        uDetailOrigin: { value: new THREE.Vector2() },
+        uDetailL0: { value: new THREE.Vector4(1, 0, 1 / 16, 0) },
+        uDetailL1: { value: new THREE.Vector4(1, 0, 1 / 4.2, 0) },
+        uDetailL2: { value: new THREE.Vector4(1, 0, 1 / 1.1, 0) },
+        uDetailOff01: { value: new THREE.Vector4() },
+        uDetailOff2: { value: new THREE.Vector2() },
+        uFaceStreaks: { value: 0.035 },
         uAbsorption: { value: new THREE.Vector3(0.32, 0.062, 0.03) },
         uBackscatter: { value: new THREE.Vector3(0.0012, 0.0018, 0.0034) },
         uSurfAbsorption: { value: new THREE.Vector3(0.01, 0.02, 0.06) },
@@ -229,6 +293,8 @@ export class OceanMesh {
       side: THREE.DoubleSide,
     });
     this.look = new WaterLook(this.material.uniforms);
+    const q = opts.quality ?? 'high';
+    this.setShading(opts.shading ?? (typeof q === 'number' ? 'high' : SHADING_FOR_QUALITY[q]));
 
     this.fullGeo = makePatchGeometry(this.P);
     this.quarterGeo = makePatchGeometry(this.P / 2);
@@ -239,11 +305,15 @@ export class OceanMesh {
       m.matrixAutoUpdate = false;
       this.object3d.add(m);
     }
-    this.setQuality(opts.quality ?? 'high');
+    this.setQuality(q, false);
   }
 
-  /** Change the vertex density (preset or near range/size ratio). */
-  setQuality(q: OceanQuality | number): void {
+  /**
+   * Change the vertex density (preset or near range/size ratio). With `withShading` (default) a
+   * preset name also selects the matching shading level.
+   */
+  setQuality(q: OceanQuality | number, withShading = true): void {
+    if (withShading && typeof q === 'string' && SHADING_FOR_QUALITY[q]) this.setShading(SHADING_FOR_QUALITY[q]);
     const lod = this.lod;
     lod.setNearRatio(typeof q === 'number' ? q : OCEAN_QUALITY_RATIO[q]);
     const morph = this.material.uniforms.uLodMorph.value as THREE.Vector2[];
@@ -255,12 +325,49 @@ export class OceanMesh {
     this.stats.levels = lod.levels;
   }
 
+  /** Current fragment shading level. */
+  get shading(): OceanShading {
+    return this.shadingLevel;
+  }
+
+  /** Change the fragment shading level (recompiles the material, regenerates the ripple tiles). */
+  setShading(level: OceanShading): void {
+    const p = OCEAN_SHADING[level];
+    if (!p) return;
+    const first = this.tiles.length === 0;
+    if (!first && level === this.shadingLevel) return;
+    this.shadingLevel = level;
+    for (const t of this.tiles) t.dispose();
+    // tile B (4.2 m: layers 1, 2 and the face streaks) always; tile A (16 m) from 2 layers up
+    const af = p.anisotropy;
+    const tileB = new RippleTile(this.renderer, { size: p.tileSize, components: p.components, worldSize: TILE_WORLD_SIZE[1], anisotropy: af, seed: 23 });
+    const tileA =
+      p.layers > 1
+        ? new RippleTile(this.renderer, { size: p.tileSizeA, components: p.componentsA, worldSize: TILE_WORLD_SIZE[0], anisotropy: af, seed: 11 })
+        : tileB;
+    this.tiles = tileA === tileB ? [tileB] : [tileA, tileB];
+    const u = this.material.uniforms;
+    u.uDetail0.value = tileA.texture;
+    u.uDetail1.value = tileB.texture;
+    (u.uDetailDecS.value as THREE.Vector4).copy(tileB.decodeScale);
+    (u.uDetailDecB.value as THREE.Vector4).copy(tileB.decodeBias);
+    const d = this.material.defines;
+    d.DETAIL_LAYERS = p.layers;
+    d.FOAM_DETAIL = p.foamDetail ? 1 : 0;
+    d.FACE_DETAIL = p.faceDetail ? 1 : 0;
+    this.material.needsUpdate = true;
+  }
+
   /** LOD ranges (3D distance from the camera, m) per level. */
   get ranges(): readonly number[] {
     return this.lod.ranges;
   }
 
-  /** 0 = off, 1 = LOD levels, 2 = normals, 3 = foam masks, 4 = breaking/fullness/ratio, 5 = body colour, 6 = black (crack test). */
+  /**
+   * 0 = off, 1 = LOD levels, 2 = normals, 3 = foam masks, 4 = breaking/fullness/ratio, 5 = body
+   * colour, 6 = black (crack test), 7 = roughness (r: total alpha, g: detail, b: chop; x4),
+   * 8 = pixel footprint (log2 colour bands).
+   */
   set debugView(mode: number) {
     this.material.uniforms.uDebug.value = mode;
   }
@@ -285,7 +392,10 @@ export class OceanMesh {
     const cam = this.camPos;
     (u.uLodOrigin.value as THREE.Vector3).set(cam.x, Math.abs(cam.y), cam.z);
     u.uTime.value = time;
-    this.updateRipples(cam, time);
+    this.renderer.getDrawingBufferSize(this.bufSize);
+    const p5 = camera.projectionMatrix.elements[5];
+    u.uPixelAngle.value = 2 / (Math.max(Math.abs(p5), 1e-6) * Math.max(this.bufSize.y, 1));
+    this.updateDetail(cam, time);
 
     this.projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     this.frustum.setFromProjectionMatrix(this.projView, camera.coordinateSystem, camera.reversedDepth);
@@ -301,6 +411,8 @@ export class OceanMesh {
   }
 
   dispose(): void {
+    for (const t of this.tiles) t.dispose();
+    this.tiles = [];
     this.fullGeo.dispose();
     this.quarterGeo.dispose();
     this.material.dispose();
@@ -309,45 +421,36 @@ export class OceanMesh {
 
   // ---------------------------------------------------------------------------------------
 
-  private readonly ripAmp = new Float64Array(RIPPLE_COUNT);
-
-  private buildRipples(mss: number): void {
-    const rng = mulberry32(90210);
-    const lMin = 0.06;
-    const lMax = 1.15;
-    const g = 9.81;
-    const sigma = 0.074 / 1025;
-    const base = Math.atan2(this.windDir.y, this.windDir.x);
-    const ak = Math.sqrt((2 * mss) / RIPPLE_COUNT);
-    for (let i = 0; i < RIPPLE_COUNT; i++) {
-      const f = (i + 0.5 + (rng() - 0.5) * 0.9) / RIPPLE_COUNT;
-      const lambda = lMin * Math.pow(lMax / lMin, f);
-      const k = (2 * Math.PI) / lambda;
-      // wide spread for short waves, some against the wind
-      const spread = (rng() - 0.5) * 2 * (rng() < 0.15 ? Math.PI : 1.25);
-      const th = base + spread;
-      this.ripK[i] = k;
-      this.ripOmega[i] = Math.sqrt(g * k + sigma * k * k * k);
-      this.ripPhase0[i] = rng() * Math.PI * 2;
-      this.ripDir[i * 2] = Math.cos(th);
-      this.ripDir[i * 2 + 1] = Math.sin(th);
-      this.ripAmp[i] = ak * (0.7 + 0.6 * rng());
-    }
-  }
-
-  private updateRipples(cam: THREE.Vector3, time: number): void {
+  /** Per frame: detail layer orientation/scale/strength from the live wind, tiles at `time`. */
+  private updateDetail(cam: THREE.Vector3, time: number): void {
     const u = this.material.uniforms;
+    const drift = u.uWindDrift.value as THREE.Vector2;
+    const dl = drift.length();
+    if (dl > 1e-4) this.windAngle = Math.atan2(drift.y, drift.x);
+    const windSpeed = dl / 0.5;
+    const mss = this.rippleMss ?? 0.016 * Math.min(Math.max(windSpeed / 4, 0.3), 2.5);
+    // camera-snapped origin keeps the detail coordinates small (float precision far from 0)
     const ox = Math.round(cam.x / 64) * 64;
     const oz = Math.round(cam.z / 64) * 64;
-    (u.uRipOrigin.value as THREE.Vector2).set(ox, oz);
-    const A = u.uRipA.value as THREE.Vector4[];
-    const TWO_PI = Math.PI * 2;
-    for (let i = 0; i < RIPPLE_COUNT; i++) {
-      const k = this.ripK[i];
-      let ph = this.ripPhase0[i] - this.ripOmega[i] * time + k * (this.ripDir[i * 2] * ox + this.ripDir[i * 2 + 1] * oz);
-      ph -= TWO_PI * Math.floor(ph / TWO_PI);
-      A[i].w = ph;
-    }
+    (u.uDetailOrigin.value as THREE.Vector2).set(ox, oz);
+    const vecs = [u.uDetailL0.value, u.uDetailL1.value, u.uDetailL2.value] as THREE.Vector4[];
+    const off01 = u.uDetailOff01.value as THREE.Vector4;
+    const off2 = u.uDetailOff2.value as THREE.Vector2;
+    const fract = (v: number): number => v - Math.floor(v);
+    DETAIL_LAYERS.forEach((layer, i) => {
+      const th = this.windAngle + layer.rotation;
+      const ax = Math.cos(th);
+      const az = Math.sin(th);
+      const inv = 1 / layer.size;
+      vecs[i].set(ax, az, inv, Math.sqrt(mss * layer.share));
+      // uv phase of the origin (exact in double precision)
+      const ou = fract((ox * ax + oz * az) * inv);
+      const ov = fract((-ox * az + oz * ax) * inv);
+      if (i === 0) off01.set(ou, ov, off01.z, off01.w);
+      else if (i === 1) off01.set(off01.x, off01.y, ou, ov);
+      else off2.set(ou, ov);
+    });
+    for (const t of this.tiles) t.update(this.renderer, time);
   }
 
   /** Upload the selected patches of one kind as instances, sorted front to back (early-z). */

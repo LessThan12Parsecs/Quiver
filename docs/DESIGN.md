@@ -41,9 +41,13 @@ tools/          headless-browser checks (gpu-check, screenshots)
   crest peaking from the Ursell number and a Kepler-equation **forward lean** that makes the face
   steep (≈45–60°) right before breaking. Explicit height field ⇒ no fold-overs, exact CPU queries.
 * Wind chop: 12 small Gerstner components (λ 1.2–16 m) on top, Lagrangian.
-* Surf spot: a ">"-shaped sandbar (A-frame peak at `z = 0`, crest at `x ≈ -20`, 1.4 m deep) that
-  makes set waves (≈1.6 m) break around `x ≈ -35 … -30` and peel both ways at ≈8 m/s; an inner
-  trough (≈3 m) where waves reform; a shore break around `x ≈ 85–95`; dry beach from `x ≈ 125`.
+* Surf spot: a ">"-shaped sandbar (A-frame peak at `z = 0`, crest at `x ≈ -20`, 1.4 m deep,
+  `sweep` 0.7, `depthSlope` 0.006) that makes set waves (≈1.6 m) break around `x ≈ -35 … -30`
+  (peak break of the t ≈ 66.7 s set wave at `x ≈ -33`) and peel both ways at ≈6–6.6 m/s for the
+  first 60–70 m, after which the outer section closes out (the earlier sweep 0.45 / 0.008 bar
+  peeled 7.5–9 m/s for 80–90 m — faster than a board can stay ahead of: autopilot median ride
+  6.3 s there vs 8.3 s now); an inner trough (≈3 m) where waves reform; a shore break around
+  `x ≈ 85–95`; dry beach from `x ≈ 125`.
 * Set waves arrive every ~3 minutes (`SET_LENGTH` 16 × 11 s period).
 
 API you will use:
@@ -109,30 +113,68 @@ water sampling ≤ ~1 ms per rendered frame). Per cell:
    stall ≈ 14°, profile + induced drag, area scaled by submerged span. They give directional
    stability (weathervaning), drive, and hold in a carve.
 6. Small angular damping proportional to wetted area (radiation damping stand-in).
+7. **Depth regimes**: once the deck is under by half the beam, motion along the normal meets
+   cross-flow drag (C_d ≈ 1) instead of the free-surface impact law and the added mass doubles to
+   the unbounded-fluid value ρπb²/4; the planing lift fades to `deepLift` (0.4) only once the
+   deck is under by half the board length. A board released 3 m deep surfaces at ≈ 5 m/s instead
+   of shooting out at 6.6 m/s.
+
+The hull keeps a little history (water velocity under each cell, smoothed wetted length); `reset`
+clears it so a spawn is reproducible whatever ran before.
 
 Carving emerges: rolling the board tilts the planing force sideways (centripetal force) and the
 fins/rails resist sideslip. Catching a wave emerges: gravity along the face slope + water moving
 up the face; you must be paddling near wave speed at the steep part to get in.
 
 ### Rider (milestone-1 model, no animation)
-A 75 kg point mass connected to the board by a stiff spring-damper ("legs") toward a **target
-COM** in board space. Reaction force applied to the board at the target point (= feet force +
-ankle torque).
+A 75 kg point mass on a 3-axis leg spring-damper (≈3 Hz, ζ 0.8) toward a **target COM** in board
+space, integrated implicitly with the board (9 DOF). The reaction acts on the board at the target
+point (= feet force + ankle torque). The ankles are **torque-limited**: across the board the feet
+hold at most normal force × `rollLever` (0.21 m: toes/heels pressing near the rails — the hull's
+own centre of pressure sits 16–22 cm off the stringer at 20–50° of bank) + a little grip, along
+it × `pitchLever` (0.3 m); past that the foot rolls on its edge (the spring perpendicular to the
+leg saturates) and the body tips.
 
 * **Prone**: COM ≈ 12 cm above the deck, lying along the stringer. Body buoyancy/drag modelled
-  with a few spheres (chest, hips, legs) that dip into the water — on a 28 L board you lie low in
-  the water, on a longboard you float high. **Paddling**: alternating arm strokes (~0.9 s),
-  thrust applied when the hand is in the water, efficiency falling with speed (hand-speed limit
-  ≈ 3 m/s ⇒ top paddle speed ≈ 2 m/s). Steering by paddling harder on one side.
+  with spheroids (chest, hips, legs). **Paddling**: alternating strokes (~0.9 s), thrust while the
+  hand is in the water, hand-speed limit ≈ 3 m/s ⇒ top paddle speed ≈ 2 m/s; steer by paddling
+  harder on one side.
 * **Pop-up**: 0.6 s transition prone → standing.
-* **Standing**: feet over the stringer (back foot near the fins). COM ≈ 0.95 m above the deck
-  (0.6 m crouched). Inputs move the target COM: forward/back weight (trim: nose down to go,
-  weight back to stall/turn) and toe/heel lean (rail to rail). Twist applies a limited yaw torque.
-  Standing still on a 28 L board sinks it (realistic). A "balance assist" (0–1) tilts the stance
-  toward the apparent gravity.
-* **Wipeout** when the ankle torque needed exceeds what the feet can resist for too long, the
-  board flips, the nose pearls, or the board is driven deep under. Then the rider floats free,
+* **Standing**: back foot over the fins, COM ≈ 0.95 m above the feet (0.6 m crouched); the COM
+  target moves like a body (2nd-order servo, bounded acceleration and speed). leanForward = trim
+  (±0.22 m), leanSide = carve, twist = yaw torque ≤ 40 N·m. `balanceAssist` (0–1) blends in a
+  skilled rider's reflex:
+  * leanSide asks for a **turn rate** (up to the tightest turn the board holds, R = 4.5 m,
+    ≤ 110°/s); the bank target (relative to the water surface) is the coordinated angle of that
+    turn + a turn-rate correction + a body-tilt correction (capped 45°, less at low speed);
+  * the body follows the turn's apparent gravity (`turnTilt` = atan(v·ω/g)), leans toward the
+    target bank — the ankle torque that rolls the board — and is never more than `leanMargin`
+    (11°, +4.6° at a full lean) beyond that apparent gravity, i.e. about what the feet can hold;
+  * fore/aft it follows the slow apparent gravity (70 %), and the ankles absorb the board pitching
+    under the body over chop (the body stays steady in the world).
+  Whether a carve holds is up to the physics. Funboard at 7 m/s, full lean: ≈ 22° of bank at
+  0.7 s, 43° max, yaw ≤ 55°/s (R ≈ 7 m).
+* **Wipeouts**: balance — the body (feet → COM) further from the slow apparent up (g − a, 0.35 s
+  filter) than the feet hold (asin(lever / leg length)) plus a recoverable tip (10° across, 12°
+  along); over the nose with the nose under water counts as a **pearl**; nose pearling at speed;
+  board flipped; board buried deep; leg over-stretched by an impact. Then the rider floats free,
   tethered by a 2.4 m leash. `R` resets.
+
+### Autopilot (`src/physics/autopilot.ts`, key O)
+A scripted skilled rider that only writes `SurfInput` (no forces, no state tweaks): if it rides
+well, the physics allows riding well. Phases: *position* (paddle to the take-off spot, x ≈ −38,
+5 m to one side of the peak), *wait* (watch for a set wave; let one pass that is already
+breaking outside and sit further out), *paddle* (when its crest is ≤ 22 m out: paddle for the
+beach angled 15° to the riding side, pop up once the board runs on the face at ≥ 0.72 c; give up
+if it passes or breaks on the rider — next time sit further in / out), *popup*, *ride* (heading
+angle from the wave direction kept in 45–75°, chosen so the speed along the wave holds a target
+height on the face — lower and faster when the curl is close; a PI heading controller with
+leanSide ≤ 0.6; trim for speed; crouch through turns), *kickout* (closed out, backed off, caught by
+the whitewater or lost the wave: turn up and over the back), *done* (auto-reset in the game).
+Measured (funboard, default ocean): from waveSpawn (6 set waves × both sides) median ride 8.3 s,
+5/12 ≥ 10 s; from the take-off spot it gets up on 75–100 % of the set waves it goes for, but the
+late, steep take-off usually ends in a fall within 1 s; from the lineup it often gets pushed in /
+caught inside by the set (few attempts). `npx tsx tools/simProbe.ts --mode autopilot [--lineup]`.
 
 ### SurfSim
 ```ts
@@ -145,20 +187,27 @@ sim.time; sim.board; sim.rider; sim.telemetry; sim.debugForces
 twist −1..1, popUp (edge), reset (edge)`.
 
 Spawn helpers: *lineup* (prone, outside the peak, facing the beach, still), *on a wave* (find the
-next set wave's steep unbroken face near the peak, place the board on it moving at ≈ wave speed,
-standing) for testing rides directly.
+next set wave's steepening, still unbroken face 20–30 m down the line from the peak (fullness
+0.5–0.75), place the board on it standing, angled 55° from the wave direction, moving with the
+wave along the wave direction and with the water across its heading) for testing rides directly.
+`T` spawns on the side whose wave comes first (alternating), `Shift+T` the other side.
 
 ## Rendering (`src/render/`)
 
 * **Ocean mesh**: camera-centred LOD grid (clipmap/CDLOD style, snapped to avoid swimming,
   morphing to avoid cracks), ≥ 0.25 m spacing near the camera, out to the horizon. Vertex shader
-  runs `oceanSurface()`. Detail normals (small waves < 1.2 m) only in the fragment shader, faded
-  with distance.
+  runs `oceanSurface()`. Detail normals (short waves ~2 cm – 5 m) only in the fragment shader:
+  two animated spectral ripple tiles (`DetailNormals.ts`, 128 short-crested components each,
+  capillary-gravity dispersion) rendered every frame and sampled at 16 m / 4.2 m / 1.1 m scales
+  with analytic ray-differential gradients; they store slope moments (LEAN mapping), so the slope
+  variance lost to filtering becomes GGX roughness (no moiré, no shimmer). Shading quality knob
+  `OceanMesh.setShading('low' | 'medium' | 'high')` (also picked by the quality preset).
 * **Water shading**: Schlick Fresnel (F0 = 0.02), sky reflection from a PMREM environment, GGX
   sun glitter, subsurface glow through thin crests and backlit faces, depth-based absorption
   over the analytic seabed (turquoise over sand, deep blue offshore), whitewater/foam from
-  `breaking`, crest foam, lingering surf-zone foam, shore swash; aerial perspective to the
-  horizon.
+  `breaking` (billow relief with crease occlusion, thin translucent vs thick opaque foam, chunky
+  broken leading edge), trailing foam that opens into lace, shore swash, streaks down steep
+  faces, glowing thin lips when backlit; aerial perspective to the horizon.
 * **Sky**: physical sky (three `Sky`) with a sun; same sun lights board, rider and sand.
 * **Beach/seabed** mesh from the bathymetry, sand shading with a wet band at the waterline.
 * **Board** mesh generated from the same shape functions as the hull; **rider** = simple
@@ -185,6 +234,7 @@ board preset, rider mass, balance assist, time scale/pause/step, sun, debug over
 | Shift | — | crouch |
 | Space | pop up | — |
 | R | reset at lineup | reset at lineup |
-| T | spawn on a wave | spawn on a wave |
+| T / Shift+T | spawn on a wave (Shift: other side) | spawn on a wave |
+| O | autopilot on/off | autopilot on/off |
 | C | cycle camera | |
 | P / [ / ] | pause / slow-mo / speed up | |

@@ -3,7 +3,8 @@
  *
  * Each particle has a fixed random seed point in the surf zone and a looping lifetime. In the
  * vertex shader the seed is mapped onto its nearest swell crest (inverting the waveform's forward
- * lean), the crest's current breaking state gates visibility, and the particle follows a ballistic
+ * lean, refined once with the crest's local state), the breaking state of the crest and of the
+ * roller just ahead of it gates visibility, and the particle follows a ballistic
  * path with drag relative to where the crest was when it was "spawned" (the crest has since moved
  * on at the phase speed, so droplets thrown off the lip fall behind it). Two populations: fine
  * droplets thrown off the lip, and soft mist puffs hanging over the roller. Lighting: sun with a
@@ -62,14 +63,21 @@ void main() {
   float u = tau / life;
 
   // Nearest crest of the dominant swell: undo the forward-lean warp phi = psi + kappa cos(psi - d).
+  // Wavenumber and lean change a lot toward a breaking crest (shoaling), so the first estimate
+  // from the seed's own state lands a few metres short; one step with the local state fixes it.
   OceanSwell s0 = oceanSwell(aSeed.xy);
   float d = uOceanParams1.w;
-  float phi0 = s0.psi + s0.skew * cos(s0.psi - d);
-  float phiC = s0.skew * cos(-d);
-  vec2 anchor = aSeed.xy - s0.dir * ((phi0 - phiC) / max(s0.k, 0.01));
+  float phi0 = s0.psi + s0.skew * (cos(s0.psi - d) - cos(-d));
+  vec2 anchor = aSeed.xy - s0.dir * (phi0 / max(s0.k, 0.01));
+  OceanSwell s1 = oceanSwell(anchor);
+  float phi1 = s1.psi + s1.skew * (cos(s1.psi - d) - cos(-d));
+  anchor -= s1.dir * (phi1 / max(s1.k, 0.01));
   OceanSwell s = oceanSwell(anchor);
-  // Breaking crests emit; fade out before the seed's nearest crest switches (seed in a trough).
-  float emit = smoothstep(0.15, 0.6, s.breaking) * smoothstep(0.3, 0.9, s.height);
+  // Breaking crests emit (the crest itself or the roller just ahead of it, where the seed lies);
+  // fade out before the seed's nearest crest switches (seed in a trough).
+  float brkC = max(s.breaking, s0.breaking * (1.0 - smoothstep(0.6, 1.6, abs(s0.psi))));
+  // (thresholds match the water shader's roller mask: whitewater shows from breaking ~0.05)
+  float emit = smoothstep(0.03, 0.35, brkC) * smoothstep(0.3, 0.9, s.height);
   emit *= 1.0 - smoothstep(2.4, 3.0, abs(s0.psi));
 
   float r1 = fract(aSeed.z * 13.37 + r0 * 7.1);
@@ -91,15 +99,15 @@ void main() {
     pos = base + vec3(0.0, 0.1 * H, 0.0) - dir * (s.speed * tau) + v0 * drag;
     pos.y -= 4.9 * tau * tau * (kind > 0.5 ? 0.45 : 0.8);
     pos.xz += uWind * (tau * 0.4);
-    size = kind > 0.5 ? mix(0.12, 0.45, r1) * (0.7 + 0.6 * u) * sqrt(H) : mix(0.02, 0.06, r1);
-    alpha = kind > 0.5 ? 0.5 : 0.9;
+    size = kind > 0.5 ? mix(0.1, 0.4, r1) * (0.7 + 0.6 * u) * sqrt(H) : mix(0.02, 0.06, r1);
+    alpha = kind > 0.5 ? 0.7 : 0.9;
   } else {
-    // mist: hangs over the roller and just behind it, rising and drifting with the wind
-    float behind = mix(-0.3, 3.0, r1 * r1) * H;
-    pos = base + vec3(0.0, mix(0.15, 0.7, r2) * H, 0.0) - dir * behind;
-    pos += vec3(uWind.x * 0.5, 0.3, uWind.y * 0.5) * tau - dir * (0.2 * s.speed * tau);
-    size = mix(0.6, 1.8, r3) * (0.6 + 0.7 * u) * sqrt(H);
-    alpha = 0.13;
+    // mist: a veil hanging over the roller and just behind it, rising and drifting with the wind
+    float behind = mix(-0.4, 3.0, r1 * r1) * H;
+    pos = base + vec3(0.0, mix(0.2, 0.8, r2) * H, 0.0) - dir * behind;
+    pos += vec3(uWind.x * 0.5, 0.35, uWind.y * 0.5) * tau - dir * (0.2 * s.speed * tau);
+    size = mix(0.8, 2.4, r3) * (0.6 + 0.7 * u) * sqrt(H);
+    alpha = 0.22 * (1.0 - 0.5 * r1);
   }
   float fade = smoothstep(0.0, 0.15, u) * (1.0 - smoothstep(0.5, 1.0, u));
   vAlpha = emit * fade * uIntensity * alpha;
@@ -125,13 +133,16 @@ void main() {
   vec2 c = gl_PointCoord * 2.0 - 1.0;
   float r2 = dot(c, c);
   if (r2 > 1.0) discard;
-  float soft = vKind > 0.5 ? pow(1.0 - r2, 1.5) * (0.55 + 0.45 * vnoise(c * 2.5 + vWorld.xz * 3.0)) : smoothstep(1.0, 0.4, r2);
+  // lip spray: clumpy droplet clusters; mist: gaussian puffs that blend into a veil
+  float soft = vKind > 1.5 ? (exp(-3.5 * r2) - 0.03) * (0.7 + 0.3 * vnoise(c * 1.7 + vWorld.xz * 0.7))
+             : vKind > 0.5 ? pow(1.0 - r2, 1.5) * (0.4 + 0.6 * smoothstep(0.15, 0.85, vnoise(c * 1.8 + vWorld.xz * 2.3)))
+             : smoothstep(1.0, 0.4, r2);
   vec3 V = normalize(cameraPosition - vWorld);
   float cosT = dot(-V, uSunDirection);
   // forward-scattering lobe (Henyey-Greenstein g = 0.75) + isotropic part
   float g = 0.75;
   float hg = (1.0 - g * g) / pow(1.0 + g * g - 2.0 * g * cosT, 1.5) / (4.0 * 3.14159265);
-  vec3 col = uSunColor * (0.08 + hg * 0.9) * 0.9 + uSkyIrradiance * 0.28;
+  vec3 col = uSunColor * (0.1 + hg * 1.1) * 0.9 + uSkyIrradiance * 0.32;
   col = applyHaze(col, vWorld, cameraPosition);
   gl_FragColor = vec4(col, vAlpha * soft);
   #include <tonemapping_fragment>
@@ -166,7 +177,7 @@ export class Spray {
       seed[i * 4 + 3] = rng();
       rnd[i * 2] = rng();
       const k = rng();
-      rnd[i * 2 + 1] = k < 0.45 ? 1 : k < 0.7 ? 2 : 0;
+      rnd[i * 2 + 1] = k < 0.42 ? 1 : k < 0.77 ? 2 : 0;
     }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3));

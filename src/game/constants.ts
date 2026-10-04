@@ -6,5 +6,5 @@ export const MAX_SUBSTEPS = 10;
 export const TIME_SCALES = [1 / 16, 1 / 8, 1 / 4, 1 / 2, 1, 2];
 /** Default start time (s): the first set of the session is building at the peak. */
 export const DEFAULT_START_TIME = 20;
-/** Wave-spawn side of the peak: +1 (+Z), −1 (−Z), 0 = alternate. */
+/** Wave-spawn side of the peak: +1 (+Z), −1 (−Z), 0 = automatic (the side with the next good wave). */
 export type SpawnSide = 1 | -1 | 0;

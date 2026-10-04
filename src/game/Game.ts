@@ -15,11 +15,11 @@
  * When paused, frames are rendered only after something changed (cheap when idle, and headless
  * screenshots need an idle compositor); `ready` turns true when no render is pending.
  *
- * URL parameters (parseGameParams): spawn=lineup|wave, side=1|-1|0 (wave side, 0 alternates),
+ * URL parameters (parseGameParams): spawn=lineup|wave, side=1|-1|0 (wave side, 0 = automatic),
  * cam=follow|orbit|beach|side, board=shortboard|funboard|longboard|softtop, t=<start time s>,
  * paused=1, scale=<time scale>, q=low|medium|high|ultra|<number>, dpr=<max pixel ratio>,
  * mass=<rider kg>, assist=<0..1>, spray=<intensity, 0 = off>, forces=1, probes=1, gui=0,
- * help=0, clean=1 (no HUD/GUI), shadows=0, xray=0.
+ * help=0, clean=1 (no HUD/GUI), shadows=0, xray=0, autopilot=1 (start with the autopilot on).
  */
 import * as THREE from 'three';
 import { DEFAULT_OCEAN_CONFIG, type OceanConfig } from '../ocean/oceanConfig';
@@ -28,6 +28,7 @@ import { OceanShaderData } from '../ocean/waveGLSL';
 import { BOARD_PRESETS, type BoardPresetId } from '../physics/boardShape';
 import { PHYSICS_DT } from '../physics/constants';
 import { type RiderPose } from '../physics/Rider';
+import { Autopilot } from '../physics/autopilot';
 import { lineupSpawn, waveSpawn } from '../physics/spawn';
 import { SurfSim, type SurfInput } from '../physics/SurfSim';
 import { BeachMesh } from '../render/BeachMesh';
@@ -47,7 +48,7 @@ export { DEFAULT_START_TIME, MAX_SUBSTEPS, TIME_SCALES, type SpawnSide } from '.
 
 export interface GameParams {
   spawn: 'lineup' | 'wave';
-  /** Wave spawn side of the peak: +1 (+Z), −1 (−Z), 0 = alternate. */
+  /** Wave spawn side of the peak: +1 (+Z), −1 (−Z), 0 = automatic (next good wave, alternating). */
   side: SpawnSide;
   cam: CameraMode;
   board: BoardPresetId;
@@ -69,6 +70,7 @@ export interface GameParams {
   clean: boolean;
   shadows: boolean;
   xray: boolean;
+  autopilot: boolean;
 }
 
 export function parseGameParams(q: URLSearchParams): GameParams {
@@ -87,7 +89,7 @@ export function parseGameParams(q: URLSearchParams): GameParams {
   const qs = q.get('q');
   let quality: OceanQuality | number = 'high';
   if (qs) quality = Number.isFinite(Number(qs)) ? Number(qs) : ((['low', 'medium', 'high', 'ultra'].includes(qs) ? qs : 'high') as OceanQuality);
-  const side = num('side', -1);
+  const side = num('side', 0);
   return {
     spawn: q.get('spawn') === 'wave' ? 'wave' : 'lineup',
     side: side > 0 ? 1 : side < 0 ? -1 : 0,
@@ -108,6 +110,7 @@ export function parseGameParams(q: URLSearchParams): GameParams {
     clean: flag('clean', false),
     shadows: flag('shadows', true),
     xray: flag('xray', true),
+    autopilot: flag('autopilot', false),
   };
 }
 
@@ -136,6 +139,8 @@ export interface QuiverState {
   breaking: number;
   paddleThrustN: number;
   balance: number;
+  /** Autopilot phase, or null when the player is in control. */
+  autopilot: string | null;
   /** All of the above finite (no NaN/Infinity in the physics state). */
   finite: boolean;
   camera: CameraMode;
@@ -161,6 +166,8 @@ export interface QuiverApi {
   stepSeconds(seconds: number): QuiverState;
   /** Spawn at the lineup or on the next wave. */
   spawn(kind: 'lineup' | 'wave', side?: 1 | -1): QuiverState;
+  /** Autopilot on/off. */
+  setAutopilot(on: boolean): void;
   setCamera(mode: CameraMode): void;
   setPaused(p: boolean): void;
   state(): QuiverState;
@@ -203,9 +210,11 @@ export class Game {
 
   paused: boolean;
   timeScale: number;
-  /** Wave-spawn side of the peak: +1, −1, or 0 = alternate. */
+  /** Wave-spawn side of the peak: +1, −1, or 0 = automatic (the side with the next good wave). */
   spawnSide: SpawnSide;
-  private nextAltSide: 1 | -1 = -1;
+  private lastSpawnSide: 1 | -1 = 1;
+  /** The scripted surfer driving the inputs (O), or null when the player is in control. */
+  autopilot: Autopilot | null = null;
   /** Seconds of the last finished ride / the best ride this session. */
   lastRide = 0;
   bestRide = 0;
@@ -363,6 +372,7 @@ export class Game {
     // --- initial spawn
     if (params.spawn === 'wave') this.spawnWave();
     else this.resetLineup(params.t);
+    if (params.autopilot) this.setAutopilot(true);
   }
 
   // ------------------------------------------------------------------------------- lifecycle
@@ -414,24 +424,65 @@ export class Game {
   resetLineup(time = this.sim.time): void {
     this.sim.reset(lineupSpawn(this.ocean, time));
     this.afterTeleport();
+    this.autopilot?.reset();
   }
 
   /**
    * Standing on the next set wave's steep unbroken face (searching forward in time, so the
-   * clock jumps ahead). Returns false if none was found (stays where it is).
+   * clock jumps ahead). Side: explicit, the configured `spawnSide`, or automatic (0): the side
+   * whose next qualifying face comes first (the same wave on both sides → the side not used last
+   * time). Returns false if none was found (stays where it is).
    */
   spawnWave(side?: 1 | -1): boolean {
-    const s: 1 | -1 = side ?? (this.spawnSide === 0 ? this.nextAltSide : this.spawnSide);
-    if (this.spawnSide === 0 && side === undefined) this.nextAltSide = s > 0 ? -1 : 1;
-    const res = waveSpawn(this.ocean, { fromTime: this.sim.time, side: s });
+    let res: ReturnType<typeof waveSpawn> = null;
+    let s: 1 | -1;
+    const fixed = side ?? (this.spawnSide === 0 ? 0 : this.spawnSide);
+    if (fixed !== 0) {
+      s = fixed;
+      res = waveSpawn(this.ocean, { fromTime: this.sim.time, side: s });
+    } else {
+      const preferred: 1 | -1 = this.lastSpawnSide > 0 ? -1 : 1;
+      const a = waveSpawn(this.ocean, { fromTime: this.sim.time, side: preferred });
+      const b = waveSpawn(this.ocean, { fromTime: this.sim.time, side: preferred > 0 ? -1 : 1, searchSeconds: a ? a.time - this.sim.time - 1 : 420 });
+      if (b && (!a || b.time < a.time - 1)) {
+        res = b;
+        s = preferred > 0 ? -1 : 1;
+      } else {
+        res = a;
+        s = preferred;
+      }
+    }
     if (!res) {
       console.warn('[quiver] waveSpawn found no wave; staying put');
       return false;
     }
+    this.lastSpawnSide = s;
     this.sim.reset(res.spawn);
     this.afterTeleport();
+    this.autopilot?.startRiding(s);
     this.hud.flash('Drop in!', `${res.waveHeight.toFixed(1)} m set wave · ${s > 0 ? 'right' : 'left'} of the peak`, 1.6, performance.now() / 1000);
     return true;
+  }
+
+  /** Turn the autopilot (scripted surfer) on or off. */
+  setAutopilot(on: boolean): void {
+    if (on === (this.autopilot !== null)) return;
+    if (!on) {
+      this.autopilot = null;
+      this.hud.flash('You surf', 'autopilot off', 1.2, performance.now() / 1000);
+      return;
+    }
+    const ap = new Autopilot(this.ocean, { autoReset: 5 });
+    const st = this.sim.rider.stance;
+    if (st === 'standing' || st === 'popping') {
+      // already up and riding: decide the side from the board's heading relative to the wave
+      const w = this.sim.telemetry.water;
+      const R = this.sim.board.R;
+      const cross = w.dirX * R[6] - w.dirZ * R[0];
+      ap.startRiding(cross >= 0 ? 1 : -1);
+    }
+    this.autopilot = ap;
+    this.hud.flash('Autopilot', 'watch a ride · O to take over', 1.6, performance.now() / 1000);
   }
 
   setBoard(id: BoardPresetId): void {
@@ -530,6 +581,7 @@ export class Game {
       breaking: t.water.breaking,
       paddleThrustN: t.paddleThrustN,
       balance: t.balance,
+      autopilot: this.autopilot ? this.autopilot.status.phase : null,
       finite: true,
       camera: this.cameraRig.mode,
       paused: this.paused,
@@ -547,7 +599,10 @@ export class Game {
         this.resetLineup();
         break;
       case 'spawnWave':
-        this.spawnWave();
+        this.spawnWave(shift ? (this.lastSpawnSide > 0 ? -1 : 1) : undefined);
+        break;
+      case 'autopilot':
+        this.setAutopilot(this.autopilot === null);
         break;
       case 'camera':
         this.cameraRig.cycle();
@@ -612,8 +667,11 @@ export class Game {
     this.prevQuat.copy(b.quaternion);
     this.prevRider.copy(sim.rider.position);
     this.prevTime = sim.time;
+    if (this.autopilot) this.autopilot.update(sim, PHYSICS_DT, this.input.surf);
+    const resetting = this.input.surf.reset;
     sim.step(PHYSICS_DT, this.input.surf);
     this.input.consumeEdges();
+    if (resetting) this.afterTeleport();
     // ride bookkeeping
     const rt = sim.telemetry.ridingTime;
     if (rt === 0 && this.lastRidingTime > 0.5) {
@@ -766,6 +824,7 @@ export class Game {
         bestRide: this.bestRide,
         gamepad: this.input.gamepadActive,
         simLoad: st.simLoad,
+        autopilot: this.autopilot ? this.autopilot.status.phase : null,
       },
       nowSec,
     );
@@ -824,6 +883,10 @@ export class Game {
     this.hintTimer = now;
     const sim = this.sim;
     const st = sim.rider.stance;
+    if (this.autopilot) {
+      this.hud.setHint(AUTOPILOT_HINT[this.autopilot.status.phase] + ' · O: take over');
+      return;
+    }
     if (st !== 'prone') {
       this.hud.setHint(st === 'popping' || sim.telemetry.riding ? null : st === 'standing' ? 'Trim with W/S, carve with A/D, crouch with Shift' : null);
       return;
@@ -906,6 +969,7 @@ export class Game {
         else this.resetLineup();
         return this.state();
       },
+      setAutopilot: (on) => this.setAutopilot(on),
       setCamera: (m) => this.setCameraMode(m),
       setPaused: (p) => this.setPaused(p),
       state: () => this.state(),
@@ -919,6 +983,16 @@ export class Game {
     return api;
   }
 }
+
+const AUTOPILOT_HINT: Record<string, string> = {
+  position: 'Autopilot: paddling to the take-off spot near the peak',
+  wait: 'Autopilot: sitting in the take-off zone, watching for a set',
+  paddle: 'Autopilot: set wave coming — paddling hard, angled toward the shoulder',
+  popup: 'Autopilot: popping up as the board starts to run',
+  ride: 'Autopilot: riding — weight on the uphill rail, trimming high in the pocket',
+  kickout: 'Autopilot: section closing — kicking out over the back',
+  done: 'Autopilot: ride over, back to the lineup soon',
+};
 
 /** Deep-ish copy of a RiderPose with its own vectors (segments shared: not used for render). */
 function clonePose(p: RiderPose): RiderPose {

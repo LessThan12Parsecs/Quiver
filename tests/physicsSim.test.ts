@@ -12,6 +12,7 @@ import { ImplicitSystem } from '../src/physics/implicit';
 import { RigidBody } from '../src/physics/RigidBody';
 import { lineupSpawn, waveSpawn } from '../src/physics/spawn';
 import { SurfSim, createSurfInput, type SurfInput } from '../src/physics/SurfSim';
+import { Autopilot } from '../src/physics/autopilot';
 
 const DT = 1 / 240;
 const calmCfg = cloneOceanConfig(DEFAULT_OCEAN_CONFIG);
@@ -254,7 +255,7 @@ describe('flat water', () => {
     expect(Math.abs(without)).toBeGreaterThan(Math.abs(withFins));
   });
 
-  it('7) carving: leanSide rolls the board onto that rail and turns it that way, without capsizing', () => {
+  it('7) carving: a full lean at 7 m/s banks the board onto that rail and turns it that way (R < 10 m), rider stays up', () => {
     for (const side of [1, -1]) {
       const sim = new SurfSim(calm, BOARD_PRESETS.funboard);
       sim.reset({ x: -75, z: 5, headingRad: 0, stance: 'standing', speed: 7, time: 0 });
@@ -262,7 +263,9 @@ describe('flat water', () => {
       input.leanSide = side;
       let integ = 0;
       let maxBank = 0;
-      run(sim, 2.5, input, (s) => {
+      let bank07 = 0;
+      let maxYaw = 0;
+      run(sim, 2.5, input, (s, i) => {
         // hold the speed with a tow along the heading (a wave face would provide it)
         const hx = s.board.R[0], hz = s.board.R[6];
         const nn = Math.hypot(hx, hz);
@@ -272,13 +275,41 @@ describe('flat water', () => {
         const f = Math.max(0, 400 * e + 300 * integ);
         s.extraBoardForce.set((f * hx) / nn, 0, (f * hz) / nn);
         maxBank = Math.max(maxBank, side * s.rider.bankAngle);
+        maxYaw = Math.max(maxYaw, side * s.rider.turnRate);
+        if (i === Math.round(0.7 / DT)) bank07 = side * s.rider.bankAngle;
       });
       const t = sim.telemetry;
-      console.log(`  leanSide ${side}: heading ${((t.headingRad * 180) / Math.PI).toFixed(1)}°, bank ${((sim.rider.bankAngle * 180) / Math.PI).toFixed(1)}° (max ${((maxBank * 180) / Math.PI).toFixed(1)}°), stance ${t.stance}`);
+      const D = 180 / Math.PI;
+      console.log(
+        `  leanSide ${side}: bank ${(bank07 * D).toFixed(1)}° at 0.7 s (max ${(maxBank * D).toFixed(1)}°), yaw rate max ${(maxYaw * D).toFixed(0)}°/s ` +
+          `(radius ${(7 / maxYaw).toFixed(1)} m), heading after 2.5 s ${(t.headingRad * D).toFixed(0)}°, stance ${t.stance}`,
+      );
       expect(t.stance).toBe('standing');
-      expect(maxBank).toBeGreaterThan((5 * Math.PI) / 180);
-      expect(side * t.headingRad).toBeGreaterThan((10 * Math.PI) / 180);
+      expect(bank07).toBeGreaterThan(20 / D);
+      expect(maxBank).toBeGreaterThan(25 / D);
+      expect(maxYaw).toBeGreaterThan(45 / D);
+      expect(7 / maxYaw).toBeLessThan(10);
+      expect(side * t.headingRad).toBeGreaterThan(45 / D);
       expect(Math.abs(t.rollRad)).toBeLessThan(1.2);
+    }
+  });
+
+  it('a hard lean below 2 m/s tips a floaty board\'s rider over; standing level does not', () => {
+    for (const id of ['softtop', 'longboard'] as const) {
+      const fallsAt = (lean: number): number => {
+        const sim = new SurfSim(calm, BOARD_PRESETS[id]);
+        sim.reset({ x: -75, z: 5, headingRad: 0, stance: 'standing', speed: 1.5, time: 0 });
+        const input = createSurfInput();
+        input.leanSide = lean;
+        let t = 0;
+        for (; t < 4 && sim.rider.stance !== 'fallen'; t += DT) sim.step(DT, input);
+        return sim.rider.stance === 'fallen' ? t : Infinity;
+      };
+      const hard = fallsAt(1);
+      const level = fallsAt(0);
+      console.log(`  ${id} at 1.5 m/s: full lean falls after ${hard.toFixed(2)} s; no lean: ${level === Infinity ? 'stays up' : `falls ${level.toFixed(2)} s`}`);
+      expect(hard).toBeLessThan(3.5);
+      expect(level).toBe(Infinity);
     }
   });
 
@@ -325,7 +356,7 @@ describe('flat water', () => {
 });
 
 describe('waves', () => {
-  it('waveSpawn finds a steep unbroken set-wave face to one side of the peak', () => {
+  it('waveSpawn finds a steepening unbroken set-wave face down the line from the peak', () => {
     const before = ocean.time;
     const ws = waveSpawn(ocean, { fromTime: 0 });
     expect(ocean.time).toBe(before); // the search restores the ocean time
@@ -333,12 +364,18 @@ describe('waves', () => {
     const r = ws!;
     console.log(`  spawn t=${r.time} at (${r.spawn.x}, ${r.spawn.z}) H=${r.waveHeight.toFixed(2)} fullness=${r.fullness.toFixed(2)} c=${r.phaseSpeed.toFixed(2)} slope=${r.slope.toFixed(2)}`);
     expect(r.waveHeight).toBeGreaterThan(1);
-    expect(r.fullness).toBeGreaterThanOrEqual(0.75);
-    expect(r.fullness).toBeLessThanOrEqual(0.92);
+    expect(r.fullness).toBeGreaterThanOrEqual(0.5);
+    expect(r.fullness).toBeLessThanOrEqual(0.75);
     expect(r.slope).toBeLessThan(0);
-    expect(Math.abs(r.spawn.z)).toBeGreaterThanOrEqual(4);
+    expect(Math.abs(r.spawn.z)).toBeGreaterThanOrEqual(15);
     expect(r.spawn.stance).toBe('standing');
     expect(r.spawn.headingRad).toBeGreaterThan(0); // angled toward +Z, away from the peak
+    // the board moves with the water across its heading (no fin kick at the start) and with the
+    // wave along the wave direction
+    const sim = new SurfSim(ocean, BOARD_PRESETS.funboard);
+    sim.reset(r.spawn);
+    expect(sim.telemetry.speedAlongWave).toBeGreaterThan(0.9 * r.phaseSpeed);
+    expect(sim.telemetry.speedAlongWave).toBeLessThan(1.1 * r.phaseSpeed);
   });
 
   // Scripted rider: hold a line across the face (heading set by the wave phase under the board,
@@ -409,5 +446,134 @@ describe('waves', () => {
     const ms = performance.now() - t0;
     console.log(`  1 s of sim: ${ms.toFixed(1)} ms (${((ms / 240) * 1000).toFixed(0)} µs/step)`);
     expect(ms).toBeLessThan(150);
+  });
+});
+
+describe('rideability (autopilot, failure cases)', () => {
+  /** Autopilot ride from a waveSpawn: seconds standing in the ride phase, why it ended, turns. */
+  function autopilotRide(from: number, side: 1 | -1, seconds = 12) {
+    const ws = waveSpawn(ocean, { fromTime: from, side })!;
+    const sim = new SurfSim(ocean, BOARD_PRESETS.funboard);
+    sim.reset(ws.spawn);
+    const ap = new Autopilot(ocean, { autoReset: Infinity });
+    ap.startRiding(side);
+    const input = createSurfInput();
+    let ride = 0;
+    let turns = 0;
+    let lastSign = 0;
+    let headingMin = Infinity;
+    let headingMax = -Infinity;
+    for (let i = 0; i < seconds / DT; i++) {
+      ap.update(sim, DT, input);
+      sim.step(DT, input);
+      if (ap.status.phase !== 'ride' || sim.rider.stance !== 'standing') break;
+      ride = (i + 1) * DT;
+      // a turn: the yaw rate swinging past ±25°/s, alternating
+      const tr = sim.rider.turnRate;
+      const sign = tr > 0.44 ? 1 : tr < -0.44 ? -1 : 0;
+      if (sign !== 0 && sign !== lastSign) {
+        turns++;
+        lastSign = sign;
+      }
+      headingMin = Math.min(headingMin, ap.status.angle);
+      headingMax = Math.max(headingMax, ap.status.angle);
+    }
+    const end = sim.rider.stance === 'fallen' ? `wipeout: ${sim.rider.wipeoutReason}` : ap.status.endReason || 'still riding';
+    return { ride, turns, end, swing: headingMax - headingMin, sim, ap };
+  }
+
+  it('autopilot rides waveSpawn waves (3 set waves × both sides): median ≥ 7 s, the best ≥ 10 s, with turns', () => {
+    const rides: number[] = [];
+    let turns = 0;
+    let swing = 0;
+    const log: string[] = [];
+    for (const from of [0, 40, 50]) {
+      for (const side of [-1, 1] as const) {
+        const r = autopilotRide(from, side);
+        rides.push(r.ride);
+        turns += r.turns;
+        swing = Math.max(swing, r.swing);
+        log.push(`${r.ride.toFixed(1)} s (${r.end}, ${r.turns} turns)`);
+      }
+    }
+    const sorted = [...rides].sort((a, b) => a - b);
+    const median = 0.5 * (sorted[2] + sorted[3]);
+    console.log(`  autopilot rides: ${log.join(' | ')}; median ${median.toFixed(2)} s`);
+    expect(median).toBeGreaterThanOrEqual(7);
+    expect(sorted[5]).toBeGreaterThanOrEqual(10);
+    expect(turns).toBeGreaterThanOrEqual(4);
+    expect(swing).toBeGreaterThan((15 * Math.PI) / 180); // the heading works the face, not one fixed line
+  });
+
+  it('no input after waveSpawn: the rider loses the wave or falls within 3 s', () => {
+    const log: string[] = [];
+    for (const from of [0, 40, 60]) {
+      for (const side of [-1, 1] as const) {
+        const ws = waveSpawn(ocean, { fromTime: from, side })!;
+        const sim = new SurfSim(ocean, BOARD_PRESETS.funboard);
+        sim.reset(ws.spawn);
+        const input = createSurfInput();
+        let t = 0;
+        let lost = Infinity;
+        for (; t < 3 && sim.rider.stance !== 'fallen'; t += DT) {
+          sim.step(DT, input);
+          if (t > 0.3 && !sim.telemetry.riding && lost === Infinity) lost = t;
+        }
+        const fell = sim.rider.stance === 'fallen';
+        log.push(fell ? `fell (${sim.rider.wipeoutReason}) ${t.toFixed(1)} s` : `lost the wave ${lost.toFixed(1)} s`);
+        expect(fell || lost < 3).toBe(true);
+      }
+    }
+    console.log(`  no input: ${log.join(' | ')}`);
+  });
+
+  it('weight fully forward on a steep take-off (the critical face next to the peak) pearls', () => {
+    let pearls = 0;
+    const log: string[] = [];
+    for (const from of [0, 40, 60]) {
+      for (const side of [-1, 1] as const) {
+        const ws = waveSpawn(ocean, { fromTime: from, side, minFullness: 0.75, maxFullness: 0.92, offsets: [8, 10, 6, 12] })!;
+        const sim = new SurfSim(ocean, BOARD_PRESETS.funboard);
+        sim.reset(ws.spawn);
+        const input = createSurfInput();
+        input.leanForward = 1;
+        let t = 0;
+        for (; t < 5 && sim.rider.stance !== 'fallen'; t += DT) sim.step(DT, input);
+        if (sim.rider.wipeoutReason === 'pearl') pearls++;
+        log.push(`${sim.rider.wipeoutReason ?? 'up'} ${t.toFixed(1)} s`);
+        expect(sim.rider.stance).toBe('fallen');
+      }
+    }
+    console.log(`  weight fully forward: ${log.join(' | ')}`);
+    expect(pearls).toBeGreaterThanOrEqual(4);
+  });
+
+  it('paddle-in: from the take-off spot the autopilot gets up on ≥ 50 % of the set waves it goes for', () => {
+    let attempts = 0;
+    let catches = 0;
+    const log: string[] = [];
+    for (const t0 of [34, 45, 56, 67]) {
+      const ap = new Autopilot(ocean, { autoReset: Infinity, side: -1 });
+      const sim = new SurfSim(ocean, BOARD_PRESETS.funboard);
+      sim.reset({ x: ap.config.takeoffX, z: -ap.config.takeoffZ, headingRad: 0, stance: 'prone', speed: 0, time: t0 });
+      const input = createSurfInput();
+      for (let i = 0; i < 16 / DT; i++) {
+        ap.update(sim, DT, input);
+        sim.step(DT, input);
+        if (ap.status.catches > 0 || (ap.status.attempts > 0 && ap.status.phase === 'position')) break;
+      }
+      attempts += ap.status.attempts;
+      catches += ap.status.catches;
+      log.push(`t${t0}: ${ap.status.catches > 0 ? `up at ${sim.telemetry.speed.toFixed(1)} m/s` : ap.status.attempts > 0 ? ap.status.endReason : 'no wave'}`);
+    }
+    console.log(`  paddle-in: ${catches}/${attempts} caught (${log.join(', ')})`);
+    expect(attempts).toBeGreaterThanOrEqual(3);
+    expect(catches / attempts).toBeGreaterThanOrEqual(0.5);
+  });
+
+  it('the autopilot is deterministic (same inputs → same ride)', () => {
+    const a = autopilotRide(40, -1, 4);
+    const b = autopilotRide(40, -1, 4);
+    expect([a.sim.board.position.x, a.sim.board.position.z, a.sim.rider.position.y]).toEqual([b.sim.board.position.x, b.sim.board.position.z, b.sim.rider.position.y]);
   });
 });

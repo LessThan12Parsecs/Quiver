@@ -7,17 +7,27 @@
  * them) and the shoaling swell. The swell gradient is taken by central differences over one
  * grid cell; the chop gradient is analytic in the fragment shader.
  *
- * Fragment: per-pixel normal = swell slope (interpolated) + analytic chop slope + capillary
- * ripples (both filtered by the pixel footprint, lost slope variance goes into roughness);
- * Schlick Fresnel, PMREM sky reflection, GGX sun glitter, water body colour from single
- * scattering + Beer-Lambert over the sand seabed along the refracted ray, subsurface glow of
- * thin backlit crests, foam (breaking crests/faces, trailing bores, lingering surf-zone lace,
- * whitecaps, swash) and aerial perspective toward the horizon sky.
+ * Fragment:
+ *  - Pixel footprint from the camera model and the interpolated swell normal (smooth; dFdx of
+ *    the displaced position jumps at triangle edges and is constant per 2x2 quad).
+ *  - Normal = swell slope (interpolated) + analytic chop slope (components finer than the
+ *    footprint fade, their slope variance goes into roughness) + short-wave detail from the
+ *    spectral ripple tiles (DetailNormals.ts) at up to three scales, applied in the tangent frame
+ *    of the macro surface. The tiles store slope moments (LEAN mapping), so filtered fetches
+ *    with analytic gradients return the slope variance lost to filtering -> GGX roughness.
+ *    Detail amplitude varies with drifting wind gusts and wind-aligned slicks; on steep faces a
+ *    stretched copy of the detail adds streaks running down the face.
+ *  - Schlick Fresnel, PMREM sky reflection, GGX sun glitter, water body colour from single
+ *    scattering + Beer-Lambert over the sand seabed along the refracted ray, subsurface glow of
+ *    thin backlit crests and lips, foam (breaking crests/faces, trailing bores, lingering
+ *    surf-zone lace, whitecaps) with a lumpy relief: bump-mapped lumps and bubble domes,
+ *    crease occlusion, thin translucent vs thick opaque foam, and aerial perspective.
+ *
+ * Shading-quality defines: DETAIL_LAYERS (1-3), FOAM_DETAIL (0/1), FACE_DETAIL (0/1).
  */
 import { OCEAN_GLSL } from '../../ocean/waveGLSL';
 import { ENV_GLSL, NOISE_GLSL } from './common';
 
-export const RIPPLE_COUNT = 24;
 export const MAX_LODS = 16;
 
 const VARYINGS = /* glsl */ `
@@ -95,14 +105,31 @@ export const OCEAN_FRAGMENT = /* glsl */ `
 ${NOISE_GLSL}
 ${ENV_GLSL}
 ${OCEAN_GLSL}
-#define RIPPLE_COUNT ${RIPPLE_COUNT}
 #define PI 3.14159265
+#ifndef DETAIL_LAYERS
+#define DETAIL_LAYERS 3
+#endif
+#ifndef FOAM_DETAIL
+#define FOAM_DETAIL 1
+#endif
+#ifndef FACE_DETAIL
+#define FACE_DETAIL 1
+#endif
 
 uniform float uTime;
-uniform vec4 uRipA[RIPPLE_COUNT];          // dirX, dirZ, k, phase (relative to uRipOrigin)
-uniform vec4 uRipAmp[RIPPLE_COUNT / 4];    // slope amplitude a*k, packed by 4
-uniform vec2 uRipOrigin;
 uniform vec2 uWindDrift;                   // wind direction * gust advection speed (m/s)
+uniform float uPixelAngle;                 // angular size of a pixel (rad)
+uniform sampler2D uDetail0;                // ripple tiles: (slope u, slope v, slope^2, height)
+uniform sampler2D uDetail1;
+uniform vec4 uDetailDecS;                  // texel decode: value = texel * S + B
+uniform vec4 uDetailDecB;
+uniform vec2 uDetailOrigin;                // world origin of the detail coordinates
+uniform vec4 uDetailL0;                    // per layer: tile u axis (world xz), 1 / tile size (1/m), slope rms
+uniform vec4 uDetailL1;
+uniform vec4 uDetailL2;
+uniform vec4 uDetailOff01;                 // uv offsets of layers 0 (xy) and 1 (zw)
+uniform vec2 uDetailOff2;
+uniform float uFaceStreaks;                // slope rms of the streaks on steep faces
 uniform vec3 uAbsorption;                  // clear offshore water absorption a, 1/m (R, G, B)
 uniform vec3 uBackscatter;                 // clear offshore water backscattering bb, 1/m
 uniform vec3 uSurfAbsorption;              // extra a in the surf zone (CDOM, suspended sediment)
@@ -117,14 +144,31 @@ uniform float uRoughness;                  // base GGX alpha
 uniform int uDebug;
 ${VARYINGS}
 
-float rippleAmp(int i) { return uRipAmp[i / 4][i - (i / 4) * 4]; }
+// World-space offsets of the surface point for a one-pixel step in screen x / y, on the plane
+// through P with normal n (ray differentials). Smooth everywhere, unlike dFdx of the interpolated
+// position (which jumps at triangle edges and is constant per 2x2 pixel quad).
+void pixelFootprint(vec3 P, vec3 n, out vec3 dpx, out vec3 dpy) {
+  vec3 right = vec3(viewMatrix[0][0], viewMatrix[1][0], viewMatrix[2][0]);
+  vec3 up = vec3(viewMatrix[0][1], viewMatrix[1][1], viewMatrix[2][1]);
+  vec3 fwd = -vec3(viewMatrix[0][2], viewMatrix[1][2], viewMatrix[2][2]);
+  vec3 d = P - cameraPosition;
+  float z = max(dot(d, fwd), 1e-3);
+  vec3 du = d / z;                      // ray at unit view depth
+  float nd = dot(n, du);
+  float lim = 0.03 * length(du);        // grazing limit (~33:1 stretch)
+  nd = nd < 0.0 ? min(nd, -lim) : max(nd, lim);
+  vec3 ex = right * uPixelAngle;
+  vec3 ey = up * uPixelAngle;
+  dpx = z * (ex - du * (dot(n, ex) / nd));
+  dpy = z * (ey - du * (dot(n, ey) / nd));
+}
 
 // Fraction of a wave component (wavenumber k, direction d) kept at the pixel footprint: the
 // footprint is projected onto the component's direction (exact anisotropic filtering of a
-// sinusoid), components with fewer than ~3 px per wavelength fade out.
+// sinusoid); components with fewer than ~5 px per wavelength fade out.
 float keepFrac(float k, vec2 d, vec2 dpx, vec2 dpy) {
   float fpd = max(abs(dot(d, dpx)), abs(dot(d, dpy))) + 1e-4;
-  return smoothstep(1.6, 4.5, OCEAN_TWO_PI / (k * fpd));
+  return smoothstep(2.0, 5.0, OCEAN_TWO_PI / (k * fpd));
 }
 
 // World-space slope of the wind chop at rest point x0 (analytic Lagrangian Jacobian, same maths as
@@ -164,19 +208,26 @@ vec2 chopSlope(vec2 x0, vec2 dpx, vec2 dpy, out float jdet, out float lostVar) {
   return vec2(a22 * gx - jxz * gz, -jxz * gx + a11 * gz) * inv;
 }
 
-// Capillary-gravity ripples (lambda < ~1.2 m), normals only.
-vec2 rippleSlope(vec2 x, vec2 dpx, vec2 dpy, float gust, out float lostVar) {
-  vec2 s = vec2(0.0);
-  lostVar = 0.0;
-  for (int i = 0; i < RIPPLE_COUNT; i++) {
-    vec4 R = uRipA[i];
-    float amp = rippleAmp(i) * gust;
-    float aa = keepFrac(R.z, R.xy, dpx, dpy);
-    float ph = R.z * dot(R.xy, x) + R.w;
-    s -= R.xy * (amp * aa * sin(ph));
-    lostVar += 0.5 * amp * amp * (1.0 - aa * aa);
+// One detail layer (tile 'tex' with axis/scale/rms A at uv offset 'off'): world-space slope (xy)
+// and height (z) of the layer, scaled by amp. The slope variance lost to filtering (LEAN: mean
+// squared slope minus squared mean slope of the filtered texel) is added to 'lostVar'. Layers
+// whose features are all far below the footprint are not fetched: their whole variance is lost.
+vec3 detailLayer(sampler2D tex, vec4 A, vec2 off, vec2 x, vec2 gx, vec2 gy, float fp, float amp, inout float lostVar) {
+  float sw = A.w * amp;
+  float keep = 1.0 - smoothstep(0.06, 0.12, fp * A.z);
+  if (keep <= 0.0) {
+    lostVar += sw * sw;
+    return vec3(0.0);
   }
-  return s;
+  vec2 a = A.xy;
+  vec2 b = vec2(-A.y, A.x);
+  vec2 uv = vec2(dot(x, a), dot(x, b)) * A.z + off;
+  vec2 ux = vec2(dot(gx, a), dot(gx, b)) * A.z;
+  vec2 uy = vec2(dot(gy, a), dot(gy, b)) * A.z;
+  vec4 t = textureGrad(tex, uv, ux, uy) * uDetailDecS + uDetailDecB;
+  float m2 = dot(t.xy, t.xy);
+  lostVar += (max(t.z - m2, 0.0) + m2 * (1.0 - keep * keep)) * sw * sw;
+  return vec3((a * t.x + b * t.y) * (sw * keep), t.w * keep);
 }
 
 // Whitewater advected at velocity vel (flow-map style: two phases cross-faded).
@@ -190,9 +241,42 @@ vec3 flowWhitewater(vec2 x, vec2 vel, float t, float fp) {
   return mix(f1, f0, w0);
 }
 
+#if FOAM_DETAIL
+// Whitewater relief: (relative height ~[-1, 1], slope d/dx, slope d/dz) and crease mask (out).
+// Billow noise (sum of |signed value noise| octaves, ~60 cm down to ~6 cm): rounded lumps of
+// every size separated by sharp creases, like cauliflower; domain-warped and churning. Octaves
+// fade out with the pixel footprint fp (m) before they can alias; the thin crease lines with the
+// footprint's long axis fpLong (they alias first at grazing angles).
+vec3 foamRelief(vec2 x, float t, float fp, float fpLong, out float crease) {
+  vec2 p = x * 1.6 + vec2(0.0, 0.25 * t);
+  mat2 j = mat2(1.6);
+  mat2 rot = mat2(0.8, -0.6, 0.6, 0.8);
+  float f = 1.6;
+  float amp = 1.0;
+  vec3 r = vec3(0.0);
+  crease = 0.0;
+  for (int i = 0; i < 4; i++) {
+    float aa = 1.0 - smoothstep(0.18, 0.45, fp * f);
+    if (aa <= 0.0) break;
+    vec3 n = vnoiseD(p);
+    float sn = 2.0 * n.x - 1.0;
+    float b = abs(sn);
+    // world slope of a billow of height 0.07 m * amp
+    vec2 g = (sign(sn) * 2.0 * 0.07 * amp) * (n.yz * j);
+    r += aa * vec3(amp * (b - 0.5), g);
+    crease = max(crease, (1.0 - smoothstep(0.03, 0.09, fpLong * f)) * amp * (1.0 - smoothstep(0.0, 0.18, b)));
+    p = rot * p * 2.1 + vec2(13.7, 5.1) + vec2(0.37, -0.21) * t;
+    j = rot * j * 2.1;
+    f *= 2.1;
+    amp *= 0.5;
+  }
+  return r;
+}
+#endif
+
 // Animated caustic network on the seabed (mean ~1); sharp in very shallow water, blurring with depth.
 float caustics(vec2 x, float t, float fp, float depth) {
-  float aa = (1.0 - smoothstep(0.015, 0.06, fp)) * (1.0 - smoothstep(0.4, 2.5, depth));
+  float aa = (1.0 - smoothstep(0.01, 0.035, fp)) * (1.0 - smoothstep(0.3, 1.8, depth));
   if (aa <= 0.0) return 1.0;
   vec2 warp = vec2(vnoise(x * 0.9 + 0.3 * t), vnoise(x * 0.9 + 9.1 - 0.3 * t)) - 0.5;
   vec2 w1 = worley(x * 2.3 + warp, t * 1.2);
@@ -212,6 +296,11 @@ float smithG(float NdotV, float NdotL, float a2) {
   float gl = NdotV * sqrt(NdotL * NdotL * (1.0 - a2) + a2);
   return 0.5 / max(gv + gl, 1e-5);
 }
+// Henyey-Greenstein phase function.
+float phaseHG(float cosT, float g) {
+  float d = 1.0 + g * g - 2.0 * g * cosT;
+  return (1.0 - g * g) / (4.0 * PI * d * sqrt(d));
+}
 
 // Perturb normal n by a world-space height gradient g (xz), projected onto the tangent plane.
 vec3 bumpNormal(vec3 n, vec2 g) {
@@ -226,28 +315,113 @@ void main() {
   vec3 V = toCam / dist;
   vec3 L = uSunDirection;
 
-  // Pixel footprint in metres (anisotropy limited to 8:1 so grazing angles don't over-blur).
-  vec3 dpx = dFdx(P);
-  vec3 dpy = dFdy(P);
+  // Pixel footprint (ray differentials on the plane of the interpolated swell normal), in metres.
+  vec3 Nsw = normalize(vec3(-vSwellSlope.x, 1.0, -vSwellSlope.y));
+  vec3 dpx;
+  vec3 dpy;
+  pixelFootprint(P, Nsw, dpx, dpy);
   float fx = length(dpx);
   float fy = length(dpy);
   float fp = max(sqrt(fx * fy), max(fx, fy) * 0.125) + 1e-4;
 
-  // Wind gusts / cat's paws: slowly drifting patches of rougher water.
+  // ---- swell state ---------------------------------------------------------------------
+  float etaS = vSwellA.x;
+  float H = vSwellA.y;
+  float brk = clamp(vSwellA.z, 0.0, 1.0);
+  float full = vSwellA.w;
+  float psi = atan(vSwellB.y, vSwellB.x);
+  float ratio = vSwellB.z;
+  float depth = oceanDepth(P.xz);
+  float column = max(P.y + depth, 0.0);   // water column under this surface point
+  float c = vSwellC.z;
+  float omega = max(c * vSwellC.w, 0.2);
+  float shallow = 1.0 - smoothstep(2.0, 12.0, depth);
+  float steepS = length(vSwellSlope);
+
+  // ---- foam masks -------------------------------------------------------------------------
+  // Active whitewater (the roller): a ragged line along the lip at breaking onset, spreading down
+  // the face as the breaker develops. Its width scales with the wave height (in metres, converted
+  // to waveform phase; the forward lean compresses the face ~2x in phase).
+  float bs = smoothstep(0.02, 0.8, brk);
+  float kDom = max(vSwellC.w, 0.02);
+  float faceExt = clamp(2.0 * kDom * (0.5 + 2.4 * H), 0.2, 1.8) * mix(0.35, 1.0, bs);
+  float backExt = clamp(kDom * (0.4 + 1.2 * H), 0.08, 0.5);
+  // ragged edges: jitter the phase window with ~1-4 m noise along the crest
+  float psiJ = psi + (vnoise(P.xz * vec2(0.35, 0.25)) - 0.5) * 0.6 * faceExt + (vnoise(P.xz * 1.1 + 7.0) - 0.5) * 0.22 * faceExt;
+  // (the front transition is wide: the foam pattern, thresholded by the coverage, cuts a chunky
+  // broken leading edge into it)
+  float onFace = smoothstep(-backExt - 0.15, -backExt * 0.3, psiJ) * (1.0 - smoothstep(faceExt * 0.45, faceExt * 1.15, psiJ));
+  float white = onFace * smoothstep(0.0, 0.45, brk) * smoothstep(0.05, 0.7, H);
+  // Trailing foam carpet left behind the roller, thinning out with time since the crest passed;
+  // bigger breakers leave more and longer-lasting foam.
+  float age = mod(-psi, 2.0 * PI) / omega;
+  float broken = smoothstep(0.92, 1.35, ratio) * smoothstep(0.35, 0.7, full + brk);
+  float trail = broken * exp(-age / (1.5 + 2.5 * H)) * smoothstep(0.08, 0.9, H);
+  // Lingering lace over the inner surf zone.
+  float surf = 0.3 * smoothstep(1.0, 2.2, ratio) * smoothstep(0.1, 0.6, H);
+
+  // ---- normal: swell + chop (geometry) + spectral detail ------------------------------------
+  // Wind gusts / cat's paws (slowly drifting rougher patches) and wind-aligned slicks.
   vec2 gp = (P.xz - uWindDrift * uTime) / 60.0;
-  float gust = 0.4 + 1.2 * vnoise(gp) * (0.55 + 0.45 * vnoise(gp * 2.7 + 5.0));
+  float gust = 0.5 + 1.1 * vnoise(gp) * (0.55 + 0.45 * vnoise(gp * 2.7 + 5.0));
+  vec2 wd = normalize(uWindDrift + vec2(1e-5, 0.0));
+  vec2 sp = vec2(dot(P.xz, wd), dot(P.xz, vec2(-wd.y, wd.x))) * vec2(1.0 / 90.0, 1.0 / 8.0);
+  float slick = smoothstep(0.72, 0.84, vnoise(sp + vec2(3.1 + 0.004 * uTime, 0.03 * uTime)));
+  slick *= 1.0 - smoothstep(0.8, 2.5, fp);
+  // no ripples under dense whitewater
+  float detAmp = gust * (1.0 - 0.55 * slick) * (1.0 - 0.9 * smoothstep(0.5, 0.9, max(white, trail)));
 
   float jdet;
   float chopLost;
-  float ripLost;
-  vec2 slope = vSwellSlope + chopSlope(vRest, dpx.xz, dpy.xz, jdet, chopLost);
-  vec2 xr = vec2(P.x - P.y, P.z) - uRipOrigin;
-  slope += rippleSlope(xr, dpx.xz, dpy.xz, gust, ripLost);
-  // Irregular capillary texture on top of the discrete ripples (breaks up their interference).
-  vec3 cap = fbm4D(xr * 4.0 + uWindDrift * (uTime * 1.6), fp * 4.0);
-  slope += cap.yz * (0.012 * gust);
-  vec3 N = normalize(vec3(-slope.x, 1.0, -slope.y));
-  if (!gl_FrontFacing) {
+  vec2 macro = vSwellSlope + chopSlope(vRest, dpx.xz, dpy.xz, jdet, chopLost);
+  vec3 Ng = normalize(vec3(-macro.x, 1.0, -macro.y));
+  vec3 Tx = normalize(vec3(1.0, macro.x, 0.0));
+  vec3 Tz = normalize(vec3(0.0, macro.y, 1.0));
+
+  // Detail coordinates follow the wave profile (x - 0.6 y ~ arc length on the front face, so
+  // steep faces aren't smeared), with a slow domain warp (no straight infinite crests).
+  vec2 xd = vec2(P.x - 0.6 * P.y, P.z) - uDetailOrigin;
+  vec2 gx = vec2(dpx.x - 0.6 * dpx.y, dpx.z);
+  vec2 gy = vec2(dpy.x - 0.6 * dpy.y, dpy.z);
+  vec2 wq = P.xz * (1.0 / 13.0) + uTime * 0.015;
+  xd += (vec2(vnoise(wq), vnoise(wq + 7.31)) - 0.5) * 0.8;
+  float detVar = 0.0;
+  // the 4.2 m layer (the most visible scale near the camera) is always sampled
+  vec3 det = detailLayer(uDetail1, uDetailL1, uDetailOff01.zw, xd, gx, gy, fp, detAmp, detVar);
+#if DETAIL_LAYERS > 1
+  det += detailLayer(uDetail0, uDetailL0, uDetailOff01.xy, xd, gx, gy, fp, detAmp, detVar);
+#else
+  detVar += uDetailL0.w * uDetailL0.w * detAmp * detAmp;
+#endif
+#if DETAIL_LAYERS > 2
+  det += detailLayer(uDetail1, uDetailL2, uDetailOff2, xd, gx, gy, fp, detAmp, detVar);
+#else
+  detVar += uDetailL2.w * uDetailL2.w * detAmp * detAmp;
+#endif
+#if FACE_DETAIL
+  // Streaks running down steep faces: the detail stretched ~8x along the wave direction.
+  float faceMask = smoothstep(0.3, 0.9, steepS) * smoothstep(0.35, 0.8, full) * smoothstep(-0.2, 0.4, sin(psi));
+  faceMask *= 1.0 - smoothstep(0.2, 0.6, max(white, trail));
+  if (faceMask > 0.01 && uFaceStreaks > 0.0) {
+    vec2 wdir = vSwellC.xy;
+    vec2 wper = vec2(-wdir.y, wdir.x);
+    vec2 sc = vec2(1.0 / 2.2, 1.0 / 16.0);
+    vec2 suv = vec2(dot(xd, wper), dot(xd, wdir)) * sc + vec2(0.37, 0.61);
+    vec2 sux = vec2(dot(gx, wper), dot(gx, wdir)) * sc;
+    vec2 suy = vec2(dot(gy, wper), dot(gy, wdir)) * sc;
+    vec4 st = textureGrad(uDetail1, suv, sux, suy) * uDetailDecS + uDetailDecB;
+    // patchy: streaks come and go along the crest
+    float patchy = smoothstep(0.25, 0.75, vnoise(vec2(dot(P.xz, wper) * 0.18, dot(P.xz, wdir) * 0.05 + 3.7)));
+    float k = uFaceStreaks * faceMask * (0.35 + 0.65 * patchy);
+    det.xy += (wper * st.x + wdir * (st.y * 0.14)) * k;
+    detVar += max(st.z - dot(st.xy, st.xy), 0.0) * k * k;
+  }
+#endif
+  vec3 N = normalize(Ng - Tx * det.x - Tz * det.y);
+
+  // Back faces seen from above (distant wave backs leaking through depth-buffer precision gaps
+  // near the horizon) are shaded like front faces.
+  if (!gl_FrontFacing && (cameraPosition.y < P.y + 0.3 || dist < 40.0)) {
     // Seen from below (camera underwater): Snell's window to the sky, total internal reflection
     // of the dark water outside it, attenuated along the in-water path to the eye.
     vec3 Nd = -N;
@@ -270,11 +444,8 @@ void main() {
   // Keep the shading normal visible from the camera (steep faces seen from behind).
   if (NdotV0 < 0.02) N = normalize(N + V * (0.02 - NdotV0));
 
-  // Roughness: base + footprint-filtered slope variance (mss ~ alpha^2) + geometric specular AA.
-  vec3 dnx = dFdx(N);
-  vec3 dny = dFdy(N);
-  float geoVar = 0.5 * max(dot(dnx, dnx), dot(dny, dny));
-  float a2 = uRoughness * uRoughness + (chopLost + ripLost) + min(geoVar, 0.1) + 1.5e-6 * dist;
+  // Roughness: base + slope variance lost to footprint filtering (chop: analytic, detail: LEAN).
+  float a2 = uRoughness * uRoughness + chopLost + detVar + 1.5e-6 * dist;
   a2 = clamp(a2, 2e-4, 0.5);
   float perceptual = sqrt(sqrt(a2));
 
@@ -282,66 +453,10 @@ void main() {
   float F = 0.02 + 0.98 * pow(1.0 - NdotV, 5.0);
   F = mix(F, 0.02 + 0.3 * (1.0 - NdotV), clamp(a2 * 2.0, 0.0, 0.4)); // rough surfaces dull the grazing rim
 
-  // ---- swell state ---------------------------------------------------------------------
-  float etaS = vSwellA.x;
-  float H = vSwellA.y;
-  float brk = clamp(vSwellA.z, 0.0, 1.0);
-  float full = vSwellA.w;
-  float psi = atan(vSwellB.y, vSwellB.x);
-  float ratio = vSwellB.z;
-  float depth = oceanDepth(P.xz);
-  float column = max(P.y + depth, 0.0);   // water column under this surface point
-  float c = vSwellC.z;
-  float omega = max(c * vSwellC.w, 0.2);
-  float shallow = 1.0 - smoothstep(2.0, 12.0, depth);
-
-  // ---- foam -----------------------------------------------------------------------------
-  // Active whitewater (the roller): a ragged line along the lip at breaking onset, spreading down
-  // the face as the breaker develops. Its width scales with the wave height (in metres, converted
-  // to waveform phase; the forward lean compresses the face ~2x in phase).
-  float bs = smoothstep(0.02, 0.8, brk);
-  float kDom = max(vSwellC.w, 0.02);
-  float faceExt = clamp(2.0 * kDom * (0.5 + 2.4 * H), 0.2, 1.8) * mix(0.35, 1.0, bs);
-  float backExt = clamp(kDom * (0.4 + 1.2 * H), 0.08, 0.5);
-  // ragged edges: jitter the phase window with ~2-4 m noise along the crest
-  float psiJ = psi + (vnoise(P.xz * vec2(0.35, 0.25)) - 0.5) * 0.6 * faceExt + (vnoise(P.xz * 1.1 + 7.0) - 0.5) * 0.15;
-  float onFace = smoothstep(-backExt - 0.15, -backExt * 0.3, psiJ) * (1.0 - smoothstep(faceExt * 0.7, faceExt, psiJ));
-  float white = onFace * smoothstep(0.0, 0.45, brk) * smoothstep(0.05, 0.7, H);
-  // Trailing foam carpet left behind the roller, thinning out with time since the crest passed;
-  // bigger breakers leave more and longer-lasting foam.
-  float age = mod(-psi, 2.0 * PI) / omega;
-  float broken = smoothstep(0.92, 1.35, ratio) * smoothstep(0.35, 0.7, full + brk);
-  float trail = broken * exp(-age / (1.5 + 2.5 * H)) * smoothstep(0.08, 0.9, H);
-  // Lingering lace over the inner surf zone.
-  float surf = 0.3 * smoothstep(1.0, 2.2, ratio) * smoothstep(0.1, 0.6, H);
   // Whitecaps where the wind chop's Jacobian folds.
   float caps = smoothstep(0.62, 0.3, jdet);
   float cov = max(max(white, trail * 0.95), max(surf, caps * 0.7));
-  float foam = 0.0;
-  float aer = 0.0;
-  float foamShade = 1.0;
-  vec3 Nf = N;
-  if (cov > 0.003) {
-    float t = uTime;
-    // Foam coordinates follow the wave profile (x - y) so steep faces aren't smeared. Foam is
-    // filtered with the geometric-mean footprint (sharper at grazing angles; it is low contrast).
-    vec2 fuv = vec2(P.x - P.y, P.z);
-    float ffp = sqrt(fx * fy) + 1e-4;
-    float act = smoothstep(0.04, 0.3, max(white, trail));
-    vec3 ww = act > 0.0 ? flowWhitewater(fuv * vec2(0.8, 1.0), vec2(c * 0.7 * max(white, trail), 0.0), t, ffp) : vec3(0.0);
-    float lace = act < 1.0 ? laceField(fuv * vec2(0.7, 1.0) + vec2(-0.1 * t, 0.025 * t), t, ffp) : 0.0;
-    float fpat = mix(lace, ww.x, act);
-    float thr = 1.0 - cov;
-    float edge = smoothstep(thr - 0.05, thr + 0.08, fpat) * smoothstep(0.0, 0.2, cov);
-    float thick = smoothstep(thr, thr + 0.35, fpat) * mix(0.55, 1.0, smoothstep(0.25, 0.75, fpat));
-    foam = edge * (0.3 + 0.7 * thick) * smoothstep(0.0, 0.35, cov);
-    foam = max(foam, smoothstep(0.85, 1.0, white) * smoothstep(0.25, 0.9, H) * (0.8 + 0.2 * ww.x));
-    foam = clamp(foam * uFoamIntensity, 0.0, 1.0);
-    foamShade = 0.78 + 0.22 * fpat;
-    aer = clamp(max(white, trail * 0.75), 0.0, 1.0);
-    // Lumpy whitewater: bump from the analytic gradient of the billow height.
-    Nf = bumpNormal(N, ww.yz * vec2(0.8, 1.0) * (0.35 * act));
-  }
+  float aer = clamp(max(white, trail * 0.75), 0.0, 1.0);
 
   // ---- water body: Lee et al. (1999) shallow-water reflectance along the refracted ray ------
   vec3 T = refract(-V, N, 1.0 / 1.333);
@@ -368,22 +483,27 @@ void main() {
   float sunShare = dot(EdSun, vec3(0.33)) / max(dot(Ed, vec3(0.33)), 1e-4);
   float cw = uCausticsIntensity * smoothstep(0.02, 0.2, Hb);
   float caust = cw > 0.0 ? mix(1.0, caustics(q, uTime, fp, Hb), cw) : 1.0;
-  vec3 rho = sandAlbedo(q, fp) * uBottomAlbedo;
+  // (the seabed is invisible under deep water: skip its procedural albedo there)
+  vec3 rho = max(attB.g, attB.b) > 1e-4 ? sandAlbedo(q, fp) * uBottomAlbedo : vec3(0.0);
   vec3 rrs = rdp * (1.0 - attC) + rho / PI * attB * (1.0 - sunShare + sunShare * caust);
   vec3 Rrs = 0.52 * rrs / (1.0 - 1.7 * rrs);
   vec3 body = Rrs * Ed;
 
-  // ---- subsurface glow of thin crests (backlit by the sun and the bright horizon) ----------
+  // ---- subsurface glow of thin crests and lips (backlit by the sun and the bright horizon) ----
   float crestH = clamp(etaS / max(H, 0.05) + 0.35, 0.0, 1.0);
-  float steep = clamp(length(vSwellSlope) * 1.2, 0.0, 1.0);
+  float steep = clamp(steepS * 1.2, 0.0, 1.0);
   float thin = crestH * crestH * (0.35 + 0.65 * steep) * smoothstep(0.15, 0.9, H);
-  float path = 0.3 + 2.5 * (1.0 - crestH) * max(H, 0.3);
+  // the upper face of a steep, nearly breaking wave is a thin sheet of water (the lip)
+  float lip = crestH * crestH * crestH * steep * smoothstep(0.55, 0.95, full) * smoothstep(0.3, 1.0, H);
+  float path = mix(0.3 + 2.5 * (1.0 - crestH) * max(H, 0.3), 0.15 + 0.8 * (1.0 - crestH) * H, lip);
   vec3 trans = exp(-(aW + 4.0 * bb) * path);
-  float back = pow(clamp(dot(V, -normalize(vec3(L.x, L.y * 0.35, L.z))), 0.0, 1.0), 3.0);
+  vec3 Ls = normalize(vec3(L.x, L.y * 0.35, L.z));    // refraction flattens the sun inside the wave
+  float cosB = dot(V, -Ls);
+  float back = pow(clamp(cosB, 0.0, 1.0), 3.0) * 0.12 + phaseHG(cosB, 0.6) * 0.25 * lip;
   float facing = clamp(0.5 - dot(N, L), 0.0, 1.0) + 0.25;
   vec3 scatterTint = bb / kap * 6.0 + vec3(0.1, 0.22, 0.18);
-  vec3 sss = (uSunColor * (back * facing * 0.12) + horizonColor(-V) * 0.25) * trans * scatterTint;
-  body += sss * thin * uSssIntensity;
+  vec3 sss = (uSunColor * (back * facing) + horizonColor(-V) * 0.25) * trans * scatterTint;
+  body += sss * (thin + 0.8 * lip) * uSssIntensity;
 
   // ---- reflection + sun glitter ------------------------------------------------------------
   vec3 R = reflect(-V, N);
@@ -405,15 +525,77 @@ void main() {
     spec = min(spec, vec3(3000.0));
   }
 
-  vec3 col = refl * F + body * (1.0 - F) / 0.98 + spec * (1.0 - foam);
+  // ---- foam ---------------------------------------------------------------------------------
+  float foam = 0.0;
+  vec3 foamCol = vec3(0.0);
+  if (cov > 0.003) {
+    float t = uTime;
+    // Foam coordinates follow the wave profile; filtered with the geometric-mean footprint
+    // (sharper at grazing angles; it is low contrast).
+    vec2 fuv = vec2(P.x - 0.6 * P.y, P.z);
+    float ffp = sqrt(fx * fy) + 1e-4;
+    // dense, freshly churned whitewater (roller + the bore just behind it) vs decaying foam: a
+    // mat with holes that opens up into a lace network as the coverage drops
+    float fresh = max(white, trail * smoothstep(0.4, 0.9, trail));
+    float act = smoothstep(0.05, 0.36, fresh);
+    vec3 ww = act > 0.0 ? flowWhitewater(fuv * vec2(0.8, 1.0), vec2(c * 0.7 * fresh, 0.0), t, ffp) : vec3(0.5, 0.0, 0.0);
+    float lace = act < 1.0 ? laceField(fuv * vec2(0.7, 1.0) + vec2(-0.1 * t, 0.025 * t), t, ffp) : 0.0;
+    if (act < 1.0) {
+      // foam left by the bore lies in streaks parallel to the crest; they carry the structure
+      // where the lace strands are already filtered out (distance)
+      vec2 cd = vSwellC.xy;
+      vec2 sx = vec2(dot(P.xz, cd) * 0.55, dot(P.xz, vec2(-cd.y, cd.x)) * 0.06);
+      float streak = fbm2(sx + 4.1, ffp * 0.55);
+      lace = clamp(lace + (streak - 0.5) * 0.7 * smoothstep(0.03, 0.15, ffp), 0.0, 1.0);
+    }
+    vec3 rel = vec3(0.0);
+    float crease = 0.0;
+#if FOAM_DETAIL
+    // isotropic relief is filtered with the long footprint axis (no streaks at grazing angles)
+    rel = foamRelief(fuv, t, min(max(fx, fy), 2.5 * ffp), max(fx, fy), crease);
+    // lace strands vary in width and break up into bubbly clumps
+    lace *= 0.9 + 0.35 * rel.x;
+#endif
+    float fpat = mix(lace, ww.x, act);
+    // The coverage threshold cuts through the billows and lumps: chunky, broken edges.
+    float pat = fpat + 0.25 * rel.x * act - 0.12 * crease;
+    float thr = 1.0 - cov;
+    float soft = mix(0.11, 0.035, act) + 0.25 * min(ffp, 0.25);
+    // at grazing angles the pattern changes much faster across screen rows than the footprint
+    // suggests: widen the threshold transition to ~1 px of the pattern's own change (no stair steps)
+    soft = max(soft, 0.7 * fwidth(pat));
+    float edge = smoothstep(thr - soft, thr + soft, pat) * smoothstep(0.0, 0.2, cov);
+    float thick = smoothstep(thr, thr + 0.35, pat) * mix(0.5, 1.0, smoothstep(0.25, 0.75, fpat)) * mix(0.6, 1.0, act);
+    // the active roller itself is continuous along the breaking section (its texture comes from
+    // the relief shading); the pattern only breaks up the leading edge and the trailing foam
+    float core = smoothstep(0.8, 1.0, white) * smoothstep(0.25, 0.9, H);
+    thick = max(thick, core * smoothstep(0.2, 0.6, ww.x + 0.3 * rel.x));
+    // thin foam is a translucent film of bubbles with holes opening along the creases; thick
+    // foam is opaque
+    edge *= 1.0 - 0.75 * (1.0 - thick) * crease;
+    foam = edge * mix(0.25, 1.0, thick) * mix(0.8, 1.0, act) * smoothstep(0.0, 0.35, cov);
+    foam = max(foam, core * (0.88 + 0.12 * ww.x));
+    foam = clamp(foam * uFoamIntensity, 0.0, 1.0);
 
-  // ---- foam shading (matte, slightly translucent: wrap lighting) ---------------------------
-  if (foam > 0.0) {
+    // relief: billows (advected with the bore) + micro lumps/bubbles; height drives occlusion
+    float hgt = (ww.x - 0.5) * act * 1.4 + rel.x + 0.25 * (thick - 0.5);
+    vec2 bump = (ww.yz * vec2(0.8, 1.0) * (0.45 * act) + rel.yz) * mix(0.35, 1.0, thick);
+    vec3 Nf = bumpNormal(Ng, bump);
+    float ao = mix(0.42, 1.0, smoothstep(-0.55, 0.35, hgt)) * (1.0 - 0.35 * crease);
+    ao = mix(1.0, ao, mix(0.4, 1.0, thick));
     float ndl = dot(Nf, L);
-    vec3 foamLight = uSunColor * max(ndl * 0.7 + 0.3, 0.0) + envIrradiance(Nf);
-    vec3 foamCol = vec3(0.8, 0.84, 0.86) * foamShade * foamLight / PI;
-    col = mix(col, foamCol, foam);
+    // thick foam: matte with self-shadowing lumps; thin foam: wrapped (light diffuses through)
+    float sunTerm = mix(max(ndl * 0.6 + 0.4, 0.0), max(ndl, 0.0) * 0.9 + 0.1 * ao, thick) * mix(0.6, 1.0, ao);
+    vec3 alb = vec3(0.86, 0.9, 0.93) * (0.85 + 0.15 * smoothstep(-0.3, 0.4, hgt));
+    foamCol = alb / PI * (uSunColor * sunTerm + envIrradiance(Nf) * ao);
+    // creases are bluish-grey: their light has travelled through aerated water
+    foamCol *= mix(vec3(0.72, 0.86, 0.95), vec3(1.0), ao);
+    // backlit thin foam glows (forward scattering through a few bubble layers)
+    foamCol += uSunColor * alb * (phaseHG(dot(V, -L), 0.55) * 0.35 * (1.0 - 0.75 * thick));
   }
+
+  vec3 col = refl * F + body * (1.0 - F) / 0.98 + spec * (1.0 - foam);
+  col = mix(col, foamCol, foam);
 
   col = applyHaze(col, P, cameraPosition);
 
@@ -429,6 +611,10 @@ void main() {
     col = body * 4.0;
   } else if (uDebug == 6) {
     col = vec3(0.0);
+  } else if (uDebug == 7) {
+    col = vec3(sqrt(a2) * 4.0, sqrt(detVar) * 4.0, sqrt(chopLost) * 4.0);
+  } else if (uDebug == 8) {
+    col = 0.5 + 0.5 * cos(6.2831 * (log2(fp) * 0.25 + vec3(0.0, 0.33, 0.67)));
   }
 
   gl_FragColor = vec4(col, 1.0);

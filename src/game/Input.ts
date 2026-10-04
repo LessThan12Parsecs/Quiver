@@ -8,8 +8,9 @@
  *   Q / E      —                        twist (yaw torque)
  *   Shift      —                        crouch
  *   Space      pop up                   —
- * Game actions (callbacks): R reset at the lineup, T spawn on a wave, C camera, P pause,
- * [ / ] slower / faster, H help, G GUI, F force arrows, . step one frame, , step one physics step.
+ * Game actions (callbacks): R reset at the lineup, T spawn on a wave (Shift+T: the other side),
+ * O autopilot on/off, C camera, P pause, [ / ] slower / faster, H help, G GUI, F force arrows,
+ * . step one frame, , step one physics step.
  *
  * Axes ramp toward their key targets (≈0.12 s) so a tap gives a partial lean. Edges (pop-up) are
  * latched until a physics step consumes them (`consumeEdges`), so they are never lost between
@@ -31,7 +32,8 @@ export type GameAction =
   | 'gui'
   | 'forces'
   | 'stepFrame'
-  | 'stepPhysics';
+  | 'stepPhysics'
+  | 'autopilot';
 
 const ACTION_KEYS: Record<string, GameAction> = {
   KeyR: 'reset',
@@ -45,6 +47,7 @@ const ACTION_KEYS: Record<string, GameAction> = {
   KeyF: 'forces',
   Period: 'stepFrame',
   Comma: 'stepPhysics',
+  KeyO: 'autopilot',
 };
 
 /** Keys whose default browser action (scrolling) is suppressed. */

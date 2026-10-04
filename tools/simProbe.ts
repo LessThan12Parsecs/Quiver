@@ -5,14 +5,19 @@
  *   npx tsx tools/simProbe.ts --board shortboard --mode back    # weight fully back (should lose it)
  *   npx tsx tools/simProbe.ts --mode none --side 1 --angle 50   # no input at all
  *   npx tsx tools/simProbe.ts --mode paddle --board funboard    # flat water, paddle then pop up
+ *   npx tsx tools/simProbe.ts --mode autopilot --board funboard # autopilot from waveSpawn
+ *   npx tsx tools/simProbe.ts --mode autopilot --lineup --seconds 120  # autopilot paddles in
  *
  * Options:
  *   --board <id>         shortboard | funboard | longboard | softtop (default softtop)
  *   --mode <m>           trim (scripted line + trim, as test 8) | back (leanForward −1) |
- *                        none (no input) | paddle (calm water: paddle from rest, pop up at --pop s)
+ *                        none (no input) | paddle (calm water: paddle from rest, pop up at --pop s) |
+ *                        autopilot (src/physics/autopilot.ts drives the SurfInput)
+ *   --lineup             autopilot: start prone at the lineup and paddle into set waves (auto-reset
+ *                        after each ride) instead of standing on a waveSpawn face
  *   --side <±1>          side of the peak for waveSpawn (default −1)
- *   --angle <deg>        heading from the wave direction toward the shoulder (default 60)
- *   --min-fullness <f>   waveSpawn minimum fullness (default 0.7)
+ *   --angle <deg>        heading from the wave direction toward the shoulder (waveSpawn default 55)
+ *   --min-fullness <f>   waveSpawn minimum fullness (waveSpawn default 0.5)
  *   --from <s>           waveSpawn search start time (default 0)
  *   --seconds <s>        simulated duration (default 8)
  *   --every <s>          print interval (default 0.1)
@@ -25,6 +30,7 @@ import { BOARD_PRESETS, type BoardPresetId } from '../src/physics/boardShape';
 import { PHYSICS_DT } from '../src/physics/constants';
 import { lineupSpawn, waveSpawn } from '../src/physics/spawn';
 import { SurfSim, createSurfInput, type Spawn } from '../src/physics/SurfSim';
+import { Autopilot } from '../src/physics/autopilot';
 
 function arg(name: string, def: string): string {
   const i = process.argv.indexOf(`--${name}`);
@@ -34,21 +40,22 @@ function arg(name: string, def: string): string {
 const boardId = arg('board', 'softtop') as BoardPresetId;
 const mode = arg('mode', 'trim');
 const side = (Number(arg('side', '-1')) < 0 ? -1 : 1) as 1 | -1;
-const angle = (Number(arg('angle', '60')) * Math.PI) / 180;
-const minFullness = Number(arg('min-fullness', '0.7'));
+const angle = process.argv.includes('--angle') ? (Number(arg('angle', '55')) * Math.PI) / 180 : undefined;
+const minFullness = process.argv.includes('--min-fullness') ? Number(arg('min-fullness', '0.5')) : undefined;
 const fromTime = Number(arg('from', '0'));
 const seconds = Number(arg('seconds', '8'));
 const every = Number(arg('every', '0.1'));
 const crouch = Number(arg('crouch', '0.5'));
 const popAt = Number(arg('pop', '4'));
+const lineup = process.argv.includes('--lineup');
 
 const spec = BOARD_PRESETS[boardId];
 if (!spec) {
   console.error(`unknown board "${boardId}" (${Object.keys(BOARD_PRESETS).join(', ')})`);
   process.exit(1);
 }
-if (!['trim', 'back', 'none', 'paddle'].includes(mode)) {
-  console.error(`unknown mode "${mode}" (trim | back | none | paddle)`);
+if (!['trim', 'back', 'none', 'paddle', 'autopilot'].includes(mode)) {
+  console.error(`unknown mode "${mode}" (trim | back | none | paddle | autopilot)`);
   process.exit(1);
 }
 
@@ -61,6 +68,10 @@ if (mode === 'paddle') {
   ocean = new OceanModel(cfg);
   spawn = lineupSpawn(ocean, 0);
   console.log(`calm water, ${boardId}, prone from rest; paddle 1, pop-up at ${popAt} s`);
+} else if (mode === 'autopilot' && lineup) {
+  ocean = new OceanModel();
+  spawn = lineupSpawn(ocean, fromTime);
+  console.log(`lineup t=${fromTime.toFixed(2)} s, ${boardId}, autopilot paddles into set waves`);
 } else {
   ocean = new OceanModel();
   const ws = waveSpawn(ocean, { fromTime, side, minFullness, angleRad: angle });
@@ -80,6 +91,13 @@ if (mode === 'paddle') {
 const sim = new SurfSim(ocean, spec);
 sim.reset(spawn);
 const input = createSurfInput();
+const pilot = mode === 'autopilot' ? new Autopilot(ocean, { autoReset: lineup ? 3 : Infinity }) : null;
+if (pilot && !lineup) pilot.startRiding(side);
+// autopilot ride metrics
+const rides: { time: number; turns: number; end: string }[] = [];
+let rideTurns = 0;
+let lastTurnSign = 0;
+let rideStart = -1;
 const DEG = 180 / Math.PI;
 const f = (v: number, d = 2, w = 7) => v.toFixed(d).padStart(w);
 
@@ -101,7 +119,7 @@ for (let i = 0; i <= n; i++) {
   input.popUp = false;
   if (mode === 'trim') {
     // same scripted rider as test 8: hold a line across the face, trim from the wave phase
-    const angT = Math.min(Math.max(angle + 1.2 * (w.wavePhase - 0.85), 0.2), 1.45);
+    const angT = Math.min(Math.max((angle ?? (55 * Math.PI) / 180) + 1.2 * (w.wavePhase - 0.85), 0.2), 1.45);
     let err = Math.atan2(w.dirZ, w.dirX) + side * angT - t.headingRad;
     err = Math.atan2(Math.sin(err), Math.cos(err));
     input.leanSide = Math.max(-1, Math.min(1, err - 0.3 * sim.rider.turnRate));
@@ -112,6 +130,28 @@ for (let i = 0; i <= n; i++) {
   } else if (mode === 'paddle') {
     input.paddle = sim.time < popAt ? 1 : 0;
     input.popUp = i === Math.round(popAt / PHYSICS_DT);
+  } else if (pilot) {
+    const phaseBefore = pilot.status.phase;
+    pilot.update(sim, PHYSICS_DT, input);
+    const ph = pilot.status.phase;
+    if (ph === 'ride' && rideStart < 0) {
+      rideStart = sim.time;
+      rideTurns = 0;
+      lastTurnSign = 0;
+    }
+    if (ph === 'ride') {
+      // count turns: the yaw rate swinging past ±25°/s with alternating sign
+      const tr = sim.rider.turnRate;
+      const sg = tr > 0.44 ? 1 : tr < -0.44 ? -1 : 0;
+      if (sg !== 0 && sg !== lastTurnSign) {
+        rideTurns++;
+        lastTurnSign = sg;
+      }
+    }
+    if (rideStart >= 0 && ph !== 'ride' && phaseBefore === 'ride') {
+      rides.push({ time: sim.time - rideStart, turns: rideTurns, end: pilot.status.endReason });
+      rideStart = -1;
+    }
   }
 
   if (i % printEvery === 0 || t.stance !== lastStance) {
@@ -123,7 +163,9 @@ for (let i = 0; i <= n; i++) {
         f(t.pitchRad * DEG, 1), f(t.rollRad * DEG, 1), f(sim.rider.bankAngle * DEG, 1),
         f(sim.rider.lean, 3, 8), f(t.submergedLiters, 1), f(t.planingLiftN, 0, 8), f(t.dragN, 0, 8), f(t.finForceN, 0, 8),
         f(t.finAlphaDeg, 0, 4), f(t.balance, 2, 4), f(t.deckDepth, 2, 5), f(t.noseDepth, 2, 5), f(t.ridingTime, 2),
-      ].join(' ') + (t.wipeoutReason && t.stance === 'fallen' ? `  wipeout: ${t.wipeoutReason}` : ''),
+      ].join(' ') +
+        (pilot ? `  AP ${pilot.status.phase} ψ*=${pilot.status.phaseTarget.toFixed(2)} ang ${(pilot.status.angle * DEG).toFixed(0)}/${(pilot.status.angleTarget * DEG).toFixed(0)}° curl ${pilot.status.curl.toFixed(0)}` : '') +
+        (t.wipeoutReason && t.stance === 'fallen' ? `  wipeout: ${t.wipeoutReason}` : ''),
     );
     lastStance = t.stance;
   }
@@ -134,6 +176,12 @@ for (let i = 0; i <= n; i++) {
 }
 
 const end = sim.telemetry;
+if (pilot) {
+  if (rideStart >= 0) rides.push({ time: sim.time - rideStart, turns: rideTurns, end: 'probe ended' });
+  const st = pilot.status;
+  console.log(`\nautopilot: waves attempted ${st.attempts}, caught ${st.catches}, rides ${rides.length}`);
+  for (const r of rides) console.log(`  ride ${r.time.toFixed(2)} s, ${r.turns} turns, end: ${r.end}`);
+}
 console.log(
   `\nsummary: longest continuous ride ${best.toFixed(2)} s, max speed ${maxSpeed.toFixed(2)} m/s, ` +
     `final stance ${end.stance}${end.wipeoutReason ? ` (${end.wipeoutReason})` : ''}, final speed ${end.speed.toFixed(2)} m/s`,

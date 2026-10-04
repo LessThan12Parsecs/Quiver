@@ -152,10 +152,10 @@ export const DEFAULT_BATHYMETRY: BathymetryConfig = {
   bar: {
     enabled: true,
     x0: -20,
-    sweep: 0.45,
+    sweep: 0.7,
     roundness: 8,
     peakDepth: 1.4,
-    depthSlope: 0.008,
+    depthSlope: 0.006,
     width: 26,
     fadeStartZ: 170,
     fadeEndZ: 250,

@@ -20,10 +20,12 @@ export interface HudInfo {
   gamepad: boolean;
   /** Real-time factor actually achieved (sim seconds per real second / time scale). */
   simLoad: number;
+  /** Autopilot phase when the scripted surfer is in control, else null. */
+  autopilot: string | null;
 }
 
 const WIPEOUT_TEXT: Record<WipeoutReason, [string, string]> = {
-  balance: ['Lost your feet', 'too much ankle torque for too long — lean less, keep the dot in the ring'],
+  balance: ['Lost your balance', 'you leaned further than the turn could hold and tipped over your feet — keep the dot in the ring'],
   flipped: ['Board flipped', 'rolled past the rail'],
   pearl: ['Pearled', 'the nose dug in — weight back on steep drops'],
   buried: ['Buried', 'the board went too deep'],
@@ -156,6 +158,7 @@ export class Hud {
         : '';
     const sim = info.simLoad < 0.97 && !info.paused ? ` · sim ${(info.simLoad * 100).toFixed(0)}%` : '';
     this.status.innerHTML =
+      `${info.autopilot ? `<b>AUTOPILOT</b> (${info.autopilot}) · ` : ''}` +
       `${info.paused ? '<b>PAUSED</b> · ' : ''}t ${t.time.toFixed(1)} s · ` +
       `${info.timeScale === 1 ? '×1' : `<b>×${fmtScale(info.timeScale)}</b>`} · ${info.camera} cam · ` +
       `${info.fps.toFixed(0)} fps${sim}${info.gamepad ? ' · gamepad' : ''}`;

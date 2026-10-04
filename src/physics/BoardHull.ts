@@ -50,6 +50,12 @@ export const HYDRO = {
   cp2: 1.0,
   /** Suction coefficient for surfaces moving away from the water (v_n < 0). */
   suction: 0.15,
+  /** Cross-flow drag coefficient of a deeply submerged surface moving along its normal (the
+   * flow separates round the board; replaces the planing law once the deck is well under water). */
+  crossflowCd: 1.0,
+  /** Lift (planing-law) coefficient of a deeply submerged surface relative to the planing value:
+   * a low-aspect-ratio plate in unbounded fluid has a smaller lift slope (≈ πAR/2 per rad). */
+  deepLift: 0.4,
   /** Low-speed radiation (wave-making) damping of normal motion, kg/(m² s). */
   radiation: 500,
   /** Tangential speed at which the radiation damping has halved, m/s. */
@@ -63,8 +69,9 @@ export const HYDRO = {
   angularDamping: 12,
   /** Immersion over which a cell goes from dry to fully wetted, m. */
   wetDepth: 0.012,
-  /** Added mass coefficient: a wetted strip of beam b carries addedMass·ρ·π·b²/8 per metre
-   * (flat plate at the free surface), distributed over its wetted cells along the bottom normal. */
+  /** Added mass coefficient: a wetted strip of beam b carries addedMass·ρ·π·b²/8 per metre (flat
+   * plate at the free surface), rising to twice that (ρ·π·b²/4, plate in unbounded fluid) once the
+   * deck is deeper than half the beam; distributed over its wetted cells along the bottom normal. */
   addedMass: 1,
   /** Seabed contact stiffness per m² of cell area, N/m³, and damping, N·s/m³. */
   seabedStiffness: 4e5,
@@ -383,6 +390,12 @@ export class BoardHull {
     this.prevWet.fill(0);
   }
 
+  /** Forget all history (water under the cells, smoothed wetted length): a fresh start. */
+  resetHistory(): void {
+    this.prevWet.fill(0);
+    this.wetLength = 1;
+  }
+
   /** Bilinear probe weights (with linear extrapolation outside the grid) for (u, v). */
   private weights(u: number, v: number, idx: Int32Array, w: Float64Array, k: number): void {
     const pu = this.pu;
@@ -600,6 +613,17 @@ export class BoardHull {
       }
       this.cellSubmerged[k] = f;
 
+      // depth regimes (0 = at the free surface, 1 = deep, water on both faces):
+      //  - motion along the normal (heave, rising/sinking): deep once the deck is under by half the
+      //    beam — impact pressure → cross-flow drag, free-surface → unbounded-fluid added mass;
+      //  - lift from the forward motion (planing law ∝ |v|·v_n): the free surface matters over a
+      //    chord, i.e. the board length — deep once the deck is under by half the length, where a
+      //    low-aspect-ratio plate lifts with a smaller slope (deepLift × the planing value).
+      const dq = dd > 0 ? Math.min(dd / (0.5 * this.beam[k]), 1) : 0;
+      const deep = dq * dq * (3 - 2 * dq);
+      const dl = dd > 0 ? Math.min(dd / (0.5 * this.shape.length), 1) : 0;
+      const liftScale = 1 - (1 - H.deepLift) * dl * dl * (3 - 2 * dl);
+
       // --- 2+3. bottom pressure and friction
       const wetB = Math.min(Math.max(db / H.wetDepth, 0), 1);
       if (wetB > 0) {
@@ -615,13 +639,14 @@ export class BoardHull {
         const vrx = vx0 + wy * rbz - wz * rby - W.vx;
         const vry = vy0 + wz * rbx - wx * rbz - W.vy;
         const vrz = vz0 + wx * rby - wy * rbx - W.vz;
-        this.surfaceForce(sys, diag, a, nx, ny, nz, vrx, vry, vrz, rbx, rby, rbz, cfHalfRho, this.sPf[k]);
+        this.surfaceForce(sys, diag, a, nx, ny, nz, vrx, vry, vrz, rbx, rby, rbz, cfHalfRho, this.sPf[k], deep, liftScale);
         fx += this.sf[0];
         fy += this.sf[1];
         fz += this.sf[2];
         // added mass of the wetted bottom (normal direction) and the diffraction force from the
         // water's normal acceleration under the cell
-        const ma = H.addedMass * rho * (Math.PI / 8) * this.beam[k] * a;
+        // (free-surface value ρπb²/8 per metre → unbounded-fluid value ρπb²/4 when deep)
+        const ma = H.addedMass * rho * (Math.PI / 8) * this.beam[k] * a * (1 + deep);
         addedMass += ma;
         sys.addBoardMass(nx, ny, nz, rbx, rby, rbz, ma);
         if (this.prevWet[k]) {
@@ -650,7 +675,7 @@ export class BoardHull {
         const vrx = vx0 + wy * rdz - wz * rdy - W.vx;
         const vry = vy0 + wz * rdx - wx * rdz - W.vy;
         const vrz = vz0 + wx * rdy - wy * rdx - W.vz;
-        this.surfaceForce(sys, diag, a, nx, ny, nz, vrx, vry, vrz, rdx, rdy, rdz, cfHalfRho, 1);
+        this.surfaceForce(sys, diag, a, nx, ny, nz, vrx, vry, vrz, rdx, rdy, rdz, cfHalfRho, 1, deep, liftScale);
         fx += this.sf[0];
         fy += this.sf[1];
         fz += this.sf[2];
@@ -831,6 +856,8 @@ export class BoardHull {
     rz: number,
     cfHalfRho: number,
     pf: number,
+    deep: number,
+    liftScale: number,
   ): void {
     const H = HYDRO;
     const rho = RHO_WATER;
@@ -838,13 +865,17 @@ export class BoardHull {
     const vm = Math.sqrt(vrx * vrx + vry * vry + vrz * vrz);
     const tx = vrx - vn * nx, ty = vry - vn * ny, tz = vrz - vn * nz;
     const vt = Math.sqrt(tx * tx + ty * ty + tz * tz);
-    const brad = H.radiation / (1 + (vt / H.radiationFadeSpeed) * (vt / H.radiationFadeSpeed));
+    const brad = (1 - deep) * H.radiation / (1 + (vt / H.radiationFadeSpeed) * (vt / H.radiationFadeSpeed));
     // pressure along −n (positive = pushing the surface out of the water)
     let p: number;
     let c: number;
     if (vn > 0) {
-      p = 0.5 * rho * a * pf * (H.cp1 * vm * vn + H.cp2 * vn * vn) + brad * a * vn;
-      c = 0.5 * rho * a * pf * (H.cp1 * (vm + (vn * vn) / Math.max(vm, 1e-6)) + 2 * H.cp2 * vn) + brad * a;
+      // planing / lift (∝ |v|·v_n, distributed along the wetted length by pf, reduced deep) +
+      // impact (∝ v_n², local: not redistributed) at the surface → cross-flow drag deep
+      const cp1 = liftScale * H.cp1;
+      const cp2 = (1 - deep) * H.cp2 + deep * H.crossflowCd;
+      p = 0.5 * rho * a * (pf * cp1 * vm * vn + cp2 * vn * vn) + brad * a * vn;
+      c = 0.5 * rho * a * (pf * cp1 * (vm + (vn * vn) / Math.max(vm, 1e-6)) + 2 * cp2 * vn) + brad * a;
     } else {
       p = -0.5 * rho * a * H.suction * vn * vn + brad * a * vn;
       c = rho * a * H.suction * -vn + brad * a;

@@ -94,7 +94,8 @@ export class Environment {
   sunToSkyRatio: number;
   hemiFill: number;
 
-  private readonly renderer: THREE.WebGLRenderer;
+  /** The renderer this environment was created for (also used for offscreen passes). */
+  readonly renderer: THREE.WebGLRenderer;
   private readonly scene: THREE.Scene;
   private readonly model: SkyModel;
   private readonly pmrem: THREE.PMREMGenerator;

@@ -56,7 +56,8 @@ export interface Spawn {
   /** Direction of the nose: angle from +X toward +Z, rad. */
   headingRad: number;
   stance: 'prone' | 'standing';
-  /** Horizontal speed along the heading (ground frame), m/s. */
+  /** Horizontal speed along the heading (ground frame), m/s. Across the heading the board moves
+   * with the water (no side-slip through the fins at the start). */
   speed?: number;
   /** Informational: spawned on a wave face. */
   onWave?: boolean;
@@ -179,6 +180,10 @@ export class SurfSim {
   /** Test/tool hooks: extra world forces on the rider COM and the board COM (N). */
   readonly extraRiderForce = new Vector3();
   readonly extraBoardForce = new Vector3();
+  /** Test/tool hook: extra world torque on the board (N·m). */
+  readonly extraBoardTorque = new Vector3();
+  /** Water moment on the board about the feet, around its long axis (+ = right rail down), N·m. */
+  hullRollMoment = 0;
   /** The last spawn passed to reset(). */
   lastSpawn: Spawn | null = null;
 
@@ -197,6 +202,9 @@ export class SurfSim {
   private readonly tmp3 = new Vector3();
   private readonly leashLocal = new Vector3();
   private readonly prevVel = new Vector3();
+  /** Leg spring axes (3 × world unit vectors) and their explicit forces (scratch). */
+  private readonly legAxes = new Float64Array(9);
+  private readonly legF = new Float64Array(3);
   private riderDampingC = 0;
   private centreCells: number[] = [];
   private noseCells: number[] = [];
@@ -262,6 +270,7 @@ export class SurfSim {
     ocean.setTime(this.time);
     const rider = this.rider;
     rider.resetState(spawn.stance);
+    this.hull.resetHistory();
     const b = this.board;
     const s = ocean.sample(spawn.x, spawn.z, this.underSample);
     // orientation: nose along the heading following the surface slope, lateral axis level (on a
@@ -283,8 +292,11 @@ export class SurfSim {
     b.quaternion.normalize();
     b.position.set(spawn.x, s.height, spawn.z);
     b.updateDerived();
-    const vx = speed * ch;
-    const vz = speed * sh;
+    // across the heading the board drifts with the water (a fin at an angle of attack at the
+    // spawn would kick the yaw)
+    const wLat = -sh * s.velX + ch * s.velZ;
+    const vx = speed * ch - wLat * sh;
+    const vz = speed * sh + wLat * ch;
     b.velocity.set(vx, s.dEtaDt + vx * s.slopeX + vz * s.slopeZ, vz);
     b.angularVelocity.set(0, 0, 0);
     this.updateBoardInertia();
@@ -304,10 +316,14 @@ export class SurfSim {
     b.updateDerived();
     b.localToWorld(rider.targetLocal, rider.position);
     b.pointVelocity(rider.position, rider.velocity);
+    // start with the legs carrying the rider's weight (static deflection), not from rest length
+    rider.position.y -= (rider.config.mass * GRAVITY) / rider.legStiffness();
     this.prevVel.copy(b.velocity);
     rider.accelFiltered.set(0, 0, 0);
     rider.accelSlow.set(0, 0, 0);
+    rider.restartEstimators();
     this.extraBoardForce.set(0, 0, 0);
+    this.extraBoardTorque.set(0, 0, 0);
     this.extraRiderForce.set(0, 0, 0);
     this.telemetry.ridingTime = 0;
     this.telemetry.wipeoutReason = null;
@@ -380,9 +396,25 @@ export class SurfSim {
     const mr = r.config.mass;
     this.setBaseMass(mb, mr);
     sys.addBoardForce(this.extraBoardForce.x, this.extraBoardForce.y - mb * GRAVITY, this.extraBoardForce.z, 0, 0, 0);
+    sys.addBoardTorque(this.extraBoardTorque.x, this.extraBoardTorque.y, this.extraBoardTorque.z);
     this.hull.recordCellForces = this.collectDebug;
     this.hull.waterDt = dt;
+    const q0 = sys.Q[0], q1 = sys.Q[1], q2 = sys.Q[2], q3 = sys.Q[3], q4 = sys.Q[4], q5 = sys.Q[5];
     this.hull.computeForces(b, sys, this.diag);
+    {
+      // water (hull + fins) moment about the feet line, around the board's long axis (+ = right
+      // rail down): what the rider's ankles must hold to keep the board at its bank
+      const fx = sys.Q[0] - q0, fy = sys.Q[1] - q1, fz = sys.Q[2] - q2;
+      const R = b.R;
+      const fm = r.feetMidLocal;
+      const rx = R[0] * fm.x + R[1] * fm.y + R[2] * fm.z;
+      const ry = R[3] * fm.x + R[4] * fm.y + R[5] * fm.z;
+      const rz = R[6] * fm.x + R[7] * fm.y + R[8] * fm.z;
+      const tx = sys.Q[3] - q3 - (ry * fz - rz * fy);
+      const ty = sys.Q[4] - q4 - (rz * fx - rx * fz);
+      const tz = sys.Q[5] - q5 - (rx * fy - ry * fx);
+      this.hullRollMoment = tx * R[0] + ty * R[3] + tz * R[6];
+    }
     const ext = this.riderExt.set(this.extraRiderForce.x, this.extraRiderForce.y - mr * GRAVITY, this.extraRiderForce.z);
     const tq = this.riderTorque.set(0, 0, 0);
     this.riderDampingC = r.segmentForces(plane, b, ext, tq);
@@ -422,17 +454,68 @@ export class SurfSim {
       const dz = r.position.z - (b.position.z + rz);
       legStretch = Math.sqrt(dx * dx + dy * dy + dz * dz);
       const tv = r.targetVelLocal;
+      // Spring axes. Standing: along the leg (feet → target COM), across it in the board's lateral
+      // direction (roll: toes/heels) and fore/aft (pitch: front/back foot). The two "ankle" axes
+      // are torque-limited: the foot pressure centre can only move within the feet, so the
+      // moment of the leg force about the feet is at most lever × load (+ grip). Beyond that the
+      // force saturates and the body tips over the edge of the feet instead of the board
+      // supplying an impossible torque. Prone: the board axes, unlimited (lying on the deck).
+      const w = r.standWeight();
+      const ax3 = this.legAxes;
+      const fm = r.feetMidLocal;
+      let hLeg = 0;
+      if (w > 0) {
+        let lx = tl.x - fm.x, ly = tl.y - fm.y, lz = tl.z - fm.z;
+        hLeg = Math.sqrt(lx * lx + ly * ly + lz * lz) || 1;
+        lx /= hLeg; ly /= hLeg; lz /= hLeg;
+        // lateral ⊥ leg (from the board z axis), fore/aft = lateral × leg … all in board axes
+        let ex = -lz * lx, ey = -lz * ly, ez = 1 - lz * lz;
+        const en = Math.sqrt(ex * ex + ey * ey + ez * ez) || 1;
+        ex /= en; ey /= en; ez /= en;
+        const px = ey * lz - ez * ly, py = ez * lx - ex * lz, pz = ex * ly - ey * lx;
+        // world directions: 0 = leg, 1 = fore/aft (pitch ankle), 2 = lateral (roll ankle)
+        ax3[0] = R[0] * lx + R[1] * ly + R[2] * lz; ax3[1] = R[3] * lx + R[4] * ly + R[5] * lz; ax3[2] = R[6] * lx + R[7] * ly + R[8] * lz;
+        ax3[3] = R[0] * px + R[1] * py + R[2] * pz; ax3[4] = R[3] * px + R[4] * py + R[5] * pz; ax3[5] = R[6] * px + R[7] * py + R[8] * pz;
+        ax3[6] = R[0] * ex + R[1] * ey + R[2] * ez; ax3[7] = R[3] * ex + R[4] * ey + R[5] * ez; ax3[8] = R[6] * ex + R[7] * ey + R[8] * ez;
+      } else {
+        // board axes: 0 = y (normal), 1 = x (along), 2 = z (lateral)
+        ax3[0] = R[1]; ax3[1] = R[4]; ax3[2] = R[7];
+        ax3[3] = R[0]; ax3[4] = R[3]; ax3[5] = R[6];
+        ax3[6] = R[2]; ax3[7] = R[5]; ax3[8] = R[8];
+      }
+      // target velocity (board local) in world
+      const tvx = R[0] * tv.x + R[1] * tv.y + R[2] * tv.z;
+      const tvy = R[3] * tv.x + R[4] * tv.y + R[5] * tv.z;
+      const tvz = R[6] * tv.x + R[7] * tv.y + R[8] * tv.z;
+      const fa = this.legF;
       for (let axis = 0; axis < 3; axis++) {
-        const ax = R[axis], ay = R[3 + axis], az = R[6 + axis];
+        const ax = ax3[3 * axis], ay = ax3[3 * axis + 1], az = ax3[3 * axis + 2];
         const d = ax * dx + ay * dy + az * dz;
-        const tdot = axis === 0 ? tv.x : axis === 1 ? tv.y : tv.z; // target velocity along this board axis
+        const tdot = ax * tvx + ay * tvy + az * tvz;
         const v = ImplicitSystem.linkVelocity(u, ax, ay, az, rx, ry, rz) - tdot;
         const k = axis === 2 ? kLat : k0;
         const c = axis === 2 ? cLat : c0;
-        const f = -k * (d - dt * tdot) - c * v;
+        fa[axis] = -k * (d - dt * tdot) - c * v;
+      }
+      let satRoll = false, satPitch = false;
+      if (w > 0) {
+        // load on the feet (leg force pushing the rider away from the board) and ankle torques
+        const load = Math.max(fa[0], 0);
+        const capR = (RIDER_MODEL.rollLever * load + RIDER_MODEL.gripTorque) * w + (1 - w) * 1e5;
+        const capP = (RIDER_MODEL.pitchLever * load + RIDER_MODEL.gripTorque) * w + (1 - w) * 1e5;
+        if (Math.abs(fa[2]) * hLeg > capR) { fa[2] = Math.sign(fa[2]) * capR / hLeg; satRoll = true; }
+        if (Math.abs(fa[1]) * hLeg > capP) { fa[1] = Math.sign(fa[1]) * capP / hLeg; satPitch = true; }
+      }
+      r.ankleSaturated = satRoll || satPitch;
+      for (let axis = 0; axis < 3; axis++) {
+        const ax = ax3[3 * axis], ay = ax3[3 * axis + 1], az = ax3[3 * axis + 2];
+        const f = fa[axis];
         sys.addRiderForce(ax * f, ay * f, az * f);
         sys.addBoardForce(-ax * f, -ay * f, -az * f, rx, ry, rz);
-        sys.addLink(ax, ay, az, rx, ry, rz, c, k);
+        const sat = (axis === 2 && satRoll) || (axis === 1 && satPitch);
+        // a saturated ankle transmits a constant (capped) force: the foot rolls on its edge, so
+        // that axis has no stiffness or damping this step
+        if (!sat) sys.addLink(ax, ay, az, rx, ry, rz, axis === 2 ? cLat : c0, axis === 2 ? kLat : k0);
       }
     } else {
       const ll = this.leashLocal;
@@ -493,7 +576,8 @@ export class SurfSim {
       const vrx = b.velocity.x - under.velX, vry = b.velocity.y - under.velY, vrz = b.velocity.z - under.velZ;
       const fwd = vrx * b.R[0] + vry * b.R[3] + vrz * b.R[6];
       let reason = r.checkWipeout(dt, b.R[4], noseDepth, fwd, deckDepth, legStretch);
-      if (!reason && lost) reason = 'balance';
+      // pitched over the front with the nose in the water: the nose caught (pearl)
+      if (!reason && lost) reason = r.tipOver === 'forward' && noseDepth > 0 ? 'pearl' : 'balance';
       if (reason && r.config.wipeouts) r.fall(reason, b);
     }
     this.telemetry.deckDepth = deckDepth;
