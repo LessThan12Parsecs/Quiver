@@ -24,7 +24,10 @@
  *
  * Water velocity (for physics) is physical rather than Lagrangian:
  *   - swell: Bernoulli along the surface in the wave frame, u = c - sqrt(c^2 - 2 g eta),
- *     plus a whitewater push toward 0.9 c on the crest/face of broken waves;
+ *     plus a whitewater push toward 0.9 c on the crest/face of broken waves, and on the crest of
+ *     a wave close to its breaking limit (crest kinematics: the crest water speeds up toward the
+ *     phase speed as the wave nears breaking — u_crest → c is the kinematic breaking criterion —
+ *     which the Bernoulli speed of the rounded model crest, ≈ 0.5 c, misses);
  *   - chop: linear orbital velocity u = omega * eta;
  *   - vertical: from the kinematic free-surface condition w = d(eta)/dt + u . grad(eta),
  *     with derivatives taken by finite differences of the exact surface, so a body moving with
@@ -55,6 +58,10 @@ export const WIND_INVERSE_ITERATIONS = 4;
 /** Ratio H/(gamma h) where whitewater starts / is fully developed. */
 export const BREAK_START = 0.95;
 export const BREAK_FULL = 1.3;
+/** Ratio H/(gamma h) where the crest water starts speeding up toward the phase speed (it reaches
+ * CREST_PUSH of the way from its Bernoulli speed to the whitewater speed 0.9 c at BREAK_START). */
+export const CREST_START = 0.85;
+export const CREST_PUSH = 0.85;
 
 /** Derived per-swell constants (also uploaded to the GPU). */
 export interface SwellParams {
@@ -505,15 +512,19 @@ export class OceanModel {
       if (i === dom) domPsi = psi;
     }
     // Whitewater: on the crest and face of a broken wave the water is carried along at ~0.9 c.
-    if (n > 0 && breaking > 0) {
+    // Near the breaking limit the crest (and the top of the face, where the lip will form)
+    // already moves at up to CREST_PUSH of the way to that speed.
+    const steep = smoothstep(CREST_START, BREAK_START, ratio) * smoothstep(0.65, 0.9, fullness);
+    if (n > 0 && (breaking > 0 || steep > 0)) {
       const c = this.sC[dom];
       const dx = this.sDx[dom];
       const dz = this.sDz[dom];
       const along = ux * dx + uz * dz;
       const target = 0.9 * c;
       const mask = smoothstep(0.3, 0.9, Math.cos(domPsi - 0.6));
+      const crest = CREST_PUSH * steep * smoothstep(0.54, 0.955, Math.cos(domPsi - 0.2));
       if (along < target) {
-        const push = (target - along) * breaking * mask;
+        const push = (target - along) * Math.max(breaking * mask, crest);
         ux += dx * push;
         uz += dz * push;
       }

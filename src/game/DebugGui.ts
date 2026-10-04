@@ -65,8 +65,8 @@ export class DebugGui {
     oceanDebug: number;
     wireframe: boolean;
     bankMaxDeg: number;
-    tipRollDeg: number;
-    rollLeverCm: number;
+    slipDeg: number;
+    railInsetCm: number;
     stallDeg: number;
   };
 
@@ -118,8 +118,8 @@ export class DebugGui {
       oceanDebug: game.oceanMesh.debugView,
       wireframe: false,
       bankMaxDeg: RIDER_MODEL.bankMax * DEG,
-      tipRollDeg: RIDER_MODEL.tipRoll * DEG,
-      rollLeverCm: RIDER_MODEL.rollLever * 100,
+      slipDeg: RIDER_MODEL.slipAngle * DEG,
+      railInsetCm: RIDER_MODEL.railInset * 100,
       stallDeg: FIN_MODEL.stallAngle * DEG,
     };
     const ui = this.ui;
@@ -135,8 +135,8 @@ export class DebugGui {
     const fs = gui.addFolder('Session');
     add(fs.add(ui, 'board', Object.keys(BOARD_PRESETS)).name('board (keeps pose)')).onChange((v: BoardPresetId) => game.setBoard(v));
     add(fs.add(ui, 'mass', 45, 120, 1).name('rider mass kg')).onChange((v: number) => game.setRiderMass(v));
-    // the rider's balance reflex, tuned at 0.85 (not "easier" toward 1: the gains over-drive)
-    add(fs.add(ui, 'assist', 0, 1, 0.01).name('balance reflex (0.85 tuned)')).onChange((v: number) => (sim.rider.config.balanceAssist = v));
+    // the quality of the rider's balance reflex: 0 clumsy … 1 very skilled (most forgiving)
+    add(fs.add(ui, 'assist', 0, 1, 0.01).name('balance skill (1 = easiest)')).onChange((v: number) => (sim.rider.config.balanceAssist = v));
     add(fs.add(ui, 'wipeouts')).onChange((v: boolean) => (sim.rider.config.wipeouts = v));
     add(fs.add(ui, 'side', { 'left (−Z)': -1, 'right (+Z)': 1, auto: 0 }).name('wave spawn side')).onChange((v: SpawnSide) => (game.spawnSide = Number(v) as SpawnSide));
     add(fs.add(ui, 'camera', CAMERA_MODES).name('camera (C)')).onChange((v: CameraMode) => game.setCameraMode(v));
@@ -219,12 +219,15 @@ export class DebugGui {
     ft.add(HYDRO, 'radiation', 0, 1500, 10).name('wave-making damping');
     ft.add(HYDRO, 'addedMass', 0, 2, 0.05).name('added mass');
     add(ft.add(ui, 'stallDeg', 8, 30, 0.5).name('fin stall °')).onChange((v: number) => (FIN_MODEL.stallAngle = v / DEG));
-    add(ft.add(ui, 'bankMaxDeg', 10, 60, 1).name('carve bank max °')).onChange((v: number) => (RIDER_MODEL.bankMax = v / DEG));
-    ft.add(RIDER_MODEL, 'minTurnRadius', 2, 12, 0.1).name('tightest turn m');
-    add(ft.add(ui, 'rollLeverCm', 5, 25, 0.5).name('toe/heel lever cm')).onChange((v: number) => (RIDER_MODEL.rollLever = v / 100));
-    add(ft.add(ui, 'tipRollDeg', 5, 40, 0.5).name('recoverable tip °')).onChange((v: number) => (RIDER_MODEL.tipRoll = v / DEG));
+    add(ft.add(ui, 'bankMaxDeg', 10, 60, 1).name('full-lean bank °')).onChange((v: number) => (RIDER_MODEL.bankMax = v / DEG));
+    add(ft.add(ui, 'railInsetCm', 0, 12, 0.5).name('support: inset from rail cm')).onChange((v: number) => {
+      RIDER_MODEL.railInset = v / 100;
+      sim.rider.applyConfig();
+    });
+    ft.add(RIDER_MODEL, 'hipTorque', 0, 3, 0.05).name('hip torque N·m/kg');
+    ft.add(RIDER_MODEL, 'recoverMargin', 0, 0.1, 0.005).name('recovery margin m');
+    add(ft.add(ui, 'slipDeg', 20, 70, 1).name('feet friction angle °')).onChange((v: number) => (RIDER_MODEL.slipAngle = v / DEG));
     ft.add(RIDER_MODEL, 'twistTorque', 0, 150, 1).name('twist torque N·m');
-    ft.add(RIDER_MODEL, 'gripTorque', 0, 60, 1).name('feet grip N·m');
     ft.close();
 
     gui.close();

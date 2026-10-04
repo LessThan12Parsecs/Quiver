@@ -179,7 +179,7 @@ export const BOARD_PRESETS = {
     rails: { deckDrop: 0.45, deckExp: 2.6, tuck: 0.25, tuckExp: 6 },
     skinDensity: 0.9,
     fins: thruster(0.285, 0.09, 0.115, 0.11, 0.0097, 0.95, 3.5, 7, 0.08),
-    stance: { backFoot: 0.3, feetSpread: 0.55, proneOffset: -0.06 },
+    stance: { backFoot: 0.57, feetSpread: 0.55, proneOffset: -0.06 },
   },
   funboard: {
     id: 'funboard',
@@ -194,7 +194,7 @@ export const BOARD_PRESETS = {
     rails: { deckDrop: 0.4, deckExp: 2.6, tuck: 0.25, tuckExp: 6 },
     skinDensity: 1.05,
     fins: thruster(0.3, 0.1, 0.12, 0.115, 0.0105, 1, 3, 6, 0.09),
-    stance: { backFoot: 0.5, feetSpread: 0.58, proneOffset: -0.06 },
+    stance: { backFoot: 0.72, feetSpread: 0.58, proneOffset: -0.06 },
   },
   longboard: {
     id: 'longboard',
@@ -226,7 +226,7 @@ export const BOARD_PRESETS = {
     rails: { deckDrop: 0.25, deckExp: 3.0, tuck: 0.3, tuckExp: 5 },
     skinDensity: 1.5,
     fins: thruster(0.3, 0.1, 0.09, 0.09, 0.0065, 1, 2, 4, 0.05),
-    stance: { backFoot: 0.72, feetSpread: 0.6, proneOffset: -0.05 },
+    stance: { backFoot: 0.8, feetSpread: 0.6, proneOffset: -0.05 },
   },
 } satisfies Record<string, BoardSpec>;
 

@@ -2,10 +2,12 @@
  * Spawn helpers.
  *
  * lineupSpawn: prone, still, outside the peak (x ≈ −75, z ≈ 5), facing the beach.
- * waveSpawn:   standing on the steepening, still unbroken face of the next set wave down the line
- *              from the peak (≈20–30 m to one side, ahead of the peeling section), moving with the
- *              wave (velocity component along the wave direction = local phase speed), angled
- *              55° from the wave direction toward the unbroken shoulder.
+ * waveSpawn:   standing on the upper part of the steepening, still unbroken face of the next set
+ *              wave down the line from the peak (≈20–30 m to one side, ahead of the peeling
+ *              section), board flat on the face, angled 55° from the wave direction toward the
+ *              unbroken shoulder, a little slower than the wave (velocity component along the wave
+ *              direction 0.8 × the local phase speed: the face's slope brings it up to speed — a
+ *              settled trim rather than a board shot across the face faster than it can sustain).
  */
 import { createSwellEval, type OceanModel } from '../ocean/waveModel';
 import type { Spawn } from './SurfSim';
@@ -40,9 +42,12 @@ export interface WaveSpawnOptions {
   searchSeconds?: number;
   /** Search time step, s. Default 0.25. */
   timeStep?: number;
-  /** Waveform phase window on the front face (0 = crest, π/2 ≈ mid face). Default [0.45, 1.05]. */
+  /** Waveform phase window on the front face (0 = crest, π/2 ≈ mid face). Default [0.25, 0.7]:
+   * the upper face (lower down, a no-input rider soon drops to the steep bottom and pearls). */
   minPhase?: number;
   maxPhase?: number;
+  /** Velocity component along the wave direction, × the local phase speed. Default 0.8. */
+  speedScale?: number;
   /** Cross-shore search range, m. Default [−70, −10]. */
   xMin?: number;
   xMax?: number;
@@ -65,10 +70,10 @@ export interface WaveSpawnResult {
  * standing spawn on it.
  * Conditions at the spot: height > minHeight, fullness in [minFullness, maxFullness],
  * breaking < maxBreaking, not broken further out (ratio < 0.95), on the upper/middle front face
- * (waveform phase 0.45–1.05 rad). Among candidates at the first qualifying time, the one nearest
- * the middle of that phase window is used. The board moves with the wave: the velocity component along the wave direction
- * equals the local phase speed, angled `angleRad` toward the shoulder (away from the peak).
- * Returns null if nothing qualifies within `searchSeconds`.
+ * (waveform phase 0.25–0.7 rad). Among candidates at the first qualifying time, the one nearest
+ * the middle of that phase window is used. The board moves with the wave: the velocity component
+ * along the wave direction is speedScale × the local phase speed, angled `angleRad` toward the
+ * shoulder (away from the peak). Returns null if nothing qualifies within `searchSeconds`.
  */
 export function waveSpawn(ocean: OceanModel, opts: WaveSpawnOptions = {}): WaveSpawnResult | null {
   const side = opts.side ?? 1;
@@ -83,8 +88,9 @@ export function waveSpawn(ocean: OceanModel, opts: WaveSpawnOptions = {}): WaveS
   const dt = opts.timeStep ?? 0.25;
   const xMin = opts.xMin ?? -70;
   const xMax = opts.xMax ?? -10;
-  const psiMin = opts.minPhase ?? 0.45;
-  const psiMax = opts.maxPhase ?? 1.05;
+  const psiMin = opts.minPhase ?? 0.25;
+  const psiMax = opts.maxPhase ?? 0.7;
+  const speedScale = opts.speedScale ?? 0.8;
   const psiTarget = 0.5 * (psiMin + psiMax);
   const se = createSwellEval();
   const savedTime = ocean.time;
@@ -125,10 +131,10 @@ export function waveSpawn(ocean: OceanModel, opts: WaveSpawnOptions = {}): WaveS
         const waveDir = Math.atan2(best.dz, best.dx);
         const heading = waveDir + side * angle;
         // the board moves with the water across its heading (SurfSim.reset); pick the speed along
-        // the heading that makes the ground velocity along the wave equal the phase speed
+        // the heading that makes the ground velocity along the wave speedScale × the phase speed
         const ws = ocean.sample(best.x, best.z);
         const wLat = -Math.sin(heading) * ws.velX + Math.cos(heading) * ws.velZ;
-        const speed = (best.c + wLat * side * Math.sin(angle)) / Math.cos(angle);
+        const speed = (speedScale * best.c + wLat * side * Math.sin(angle)) / Math.cos(angle);
         result = {
           spawn: {
             x: best.x,

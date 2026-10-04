@@ -16,7 +16,7 @@
  */
 import * as THREE from 'three';
 import { MAX_SWELLS, MAX_WIND_WAVES, SET_LENGTH } from './oceanConfig';
-import { BREAK_FULL, BREAK_START, TimeSlot, type OceanModel } from './waveModel';
+import { BREAK_FULL, BREAK_START, CREST_PUSH, CREST_START, TimeSlot, type OceanModel } from './waveModel';
 
 const f = (v: number): string => (Number.isInteger(v) ? v.toFixed(1) : String(v));
 
@@ -238,12 +238,14 @@ OceanSwell oceanSwell(vec2 p) {
     vel += sD[i] * u;
     if (i == dom) domPsi = psi;
   }
-  if (uSwellCount > 0 && breaking > 0.0) {
+  float steep = smoothstep(${f(CREST_START)}, ${f(BREAK_START)}, ratio) * smoothstep(0.65, 0.9, fullness);
+  if (uSwellCount > 0 && (breaking > 0.0 || steep > 0.0)) {
     float c = sC[dom];
     float along = dot(vel, sD[dom]);
     float target = 0.9 * c;
     float mask = smoothstep(0.3, 0.9, cos(domPsi - 0.6));
-    if (along < target) vel += sD[dom] * ((target - along) * breaking * mask);
+    float crest = ${f(CREST_PUSH)} * steep * smoothstep(0.54, 0.955, cos(domPsi - 0.2));
+    if (along < target) vel += sD[dom] * ((target - along) * max(breaking * mask, crest));
   }
   OceanSwell o;
   o.eta = eta;

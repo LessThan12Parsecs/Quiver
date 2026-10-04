@@ -1,12 +1,10 @@
 /**
- * Rider model (milestone 1): a point mass on stiff "legs" plus buoyant/draggy body segments.
+ * Rider model: a point mass on "legs" plus buoyant/draggy body segments.
  *
- * - The rider is a point mass (default 75 kg) held by a 3-axis spring-damper (≈3 Hz, ζ≈0.8)
- *   toward a target COM fixed in board space. SurfSim couples it implicitly to the board; the
- *   reaction acts on the board at the target point (= feet force + ankle torque).
- * - While attached (prone/popping/standing) the rider's body rotates with the board: its own
- *   moment of inertia about its COM is added to the board's, and forces on body segments act on
- *   the point mass with their moment about the rider COM transmitted to the board.
+ * - The rider is a point mass (default 75 kg). SurfSim couples it implicitly to the board through
+ *   the legs. Prone and while popping up it is held by a stiff 3-axis spring-damper toward a
+ *   target COM in board space and its own moment of inertia is lumped into the board's (it lies on
+ *   / crouches over the board). Standing, it is an inverted pendulum on the feet (below).
  * - Body segments are spheroids (two chest halves, hips, thighs, shins) carrying the whole body
  *   volume m/990 kg/m³ (≈0.076 m³ for 75 kg, wetsuit and lungs included, so a fallen rider just
  *   floats) that provide buoyancy and drag when they dip into the water.
@@ -19,30 +17,38 @@
  *             without paddling pivots the board on the spot. leanForward slides the body ±15 cm,
  *             leanSide ±5 cm.
  *   popping:  0.6 s blend prone → standing (the legs push the board down).
- *   standing: back foot over the fins, front foot `feetSpread` ahead; COM 0.95 m above the feet
- *             (0.6 m crouched). leanForward shifts the COM ±0.22 m (trim); leanSide asks for a
- *             carve; twist counter-rotates the upper body (a yaw DOF about the deck normal, see
- *             twistUpdate): an internal torque, so it turns the board only as far as the body can
- *             wind against it — sustained turning comes from the water (fins, rails, a sunk tail).
- *             The COM target moves like a body (2nd-order servo with bounded acceleration and
- *             speed). balanceAssist (0..1) blends in a skilled rider's reflex (updateTargets):
- *             leanSide → a turn rate → a bank target (relative to the water surface) of the
- *             coordinated angle of that turn; the body follows the turn's apparent gravity, leans
- *             toward the target bank (that ankle torque is what rolls the board) and never more
- *             than ≈ what the feet can hold beyond it.
- *             Fore/aft the stance follows the slow apparent gravity while the ankles absorb the
- *             board pitching underneath (chop). Whether the carve holds is up to the physics.
+ *   standing: the feet stand across the stringer (BoardSpec.stance); the body is a linear inverted
+ *             pendulum on them (see "Standing balance").
  *   fallen:   detached; floats with its segments (resting on the seabed / beach where it is
  *             shallow or dry), tethered by a 2.4 m leash to the tail.
  *
- * Feet: torque-limited ankles (SurfSim) — the feet hold at most normal force × rollLever (toes /
- * heels, ≈ 21 cm) across and × pitchLever (between the feet) along the board (+ a little grip);
- * past that the foot rolls on its edge and the body tips.
- *
- * Wipeouts: the body (feet → COM) further from the slow apparent up (g − a) than the feet can hold
- * (asin(lever / leg length)) plus a recoverable tip (10° across, 12° along) — over the nose with
- * the nose in the water counts as a pearl; board flipped; nose pearling at speed; board buried
- * deep; legs over-stretched by an impact.
+ * Standing balance (linear inverted pendulum + capture point)
+ *   Frame: the apparent up u = (a + g)/|a + g| (a = filtered acceleration of the board + rider COM:
+ *   what the rider's balance senses), e_x = the board's long axis and e_z = its lateral axis, both
+ *   projected ⟂ u. With the COM r (relative to the feet midpoint) at height h along u, the pendulum
+ *   frequency is ω0 = √(|a + g| / h), and the capture point ξ = r⟂ + v⟂/ω0 (v = COM velocity
+ *   relative to the feet) is where the centre of pressure (CoP) would have to be to bring the
+ *   body to rest over it. The support is the deck under the feet: across ±½ foot length from the
+ *   stringer (toes / heels), along from the back of the back foot to the front of the front foot.
+ *   The leg force on the rider runs from the CoP p through the COM: F = N u + (N/h)(r⟂ − p) (N =
+ *   leg load), so the body accelerates away from the CoP, r̈⟂ = ω0²(r⟂ − p). The reaction acts on
+ *   the board at the CoP (SurfSim applies it on the force line through the COM): CoP off the
+ *   stringer = toe/heel pressure = the torque that edges the board. No other torque.
+ *   The reflex (capture-point control) aims ξ at an aim point inside the support:
+ *       p = aim + (1 + k/ω0)(ξ − aim), clamped to the usable support,
+ *   which, unsaturated, is a spring-damper on the COM (poles −ω0 and −k). Aim: across, the edge
+ *   pressure that drives the board toward the bank the rider wants (leanSide → bank relative to
+ *   the water surface, a full lean = bankMax); along, the trim (leanForward). The rider crouches
+ *   (input, and a reflex when ξ nears the edge: a lower COM is quicker and recovers more).
+ *   balanceAssist (0..1) is the quality of that reflex: capture gain, how much of the feet it
+ *   dares to use, how firmly it presses the rail for a bank error, the crouch reflex.
+ *   A lean is a bank target: at speed the banked board turns and the turn's apparent gravity
+ *   tilts u under the leaning body; without speed it does not turn, the rail sinks and the board
+ *   rolls over under the feet (or they slip off a deck tilted past the friction angle).
+ *   The rider falls only when the physics leaves no way back: the capture point is beyond the
+ *   support (+ a small recovery margin) with the COM already past the edge of the feet, or the
+ *   leg force is further from the deck normal than the feet's friction angle (they slip), or the
+ *   board flipped / buried / the legs were over-stretched by an impact.
  */
 import { Vector3 } from 'three';
 import type { BoardShape } from './boardShape';
@@ -59,7 +65,7 @@ export interface RiderConfig {
   /** Leg spring natural frequency (with the rider mass), Hz. */
   legFrequency: number;
   legDampingRatio: number;
-  /** 0 = raw balance (very hard), 1 = perfect automatic balance reflex. */
+  /** Quality of the balance reflex: 0 = clumsy, 1 = very skilled body (most forgiving). */
   balanceAssist: number;
   /** COM height above the feet standing tall / fully crouched, m. */
   standHeight: number;
@@ -95,44 +101,91 @@ export const DEFAULT_RIDER_CONFIG: RiderConfig = {
   wipeouts: true,
 };
 
-/** Rider tunables that are not per-rider. */
+
+/** Interpolate a [clumsy, skilled] pair by the balance reflex quality. */
+export function skill(pair: readonly [number, number], assist: number): number {
+  const a = assist < 0 ? 0 : assist > 1 ? 1 : assist;
+  return pair[0] + (pair[1] - pair[0]) * a;
+}
+
+/** Rider tunables that are not per-rider (plain object: a debug GUI may edit it). */
 export const RIDER_MODEL = {
-  /** Stance lean relative to the deck from a full leanSide without assist (raw balance), rad. */
-  leanRaw: (35 * Math.PI) / 180,
-  /** Assisted carving: bank (relative to the water surface) asked for by a full leanSide, rad. */
-  bankMax: (45 * Math.PI) / 180,
-  /** Tightest turn radius the assisted rider asks for, m (caps the bank at low speed), and the
-   * highest turn rate, rad/s. */
-  minTurnRadius: 4.5,
-  turnRateMax: (110 * Math.PI) / 180,
-  /** Assisted roll reflex (see Rider.updateTargets), rad, rad/s:
-   * bank target (relative to the water surface) = atan(v·ωc/g) + rateP·(ωc − ω) + steer·(bodyTilt
-   * − turnTilt) + steerD·bodyTiltRate, capped (ωc = leanSide × the tightest turn rate, ramped);
-   * lean = turn·(turnTilt − bodyTilt) + ff·bankTarget + p·(bankTarget − bank) − bal·balanceRoll −
-   * d·bodyTiltRate − phiD·bankRate, kept within leanMargin (+ sideMargin·leanSide²) of the turn's
-   * apparent gravity. Gains tuned by a policy search on flat-water carves and autopilot wave rides
-   * (see the physics notes in docs/DESIGN.md). */
-  carve: {
-    turn: 0.2821,
-    ff: 0.3326,
-    p: 0.5593,
-    bal: 0.2799,
-    d: 0.4343,
-    phiD: 0.1351,
-    rateP: 0.2208,
-    steer: -0.9103,
-    steerD: 0.051,
-    /** Body tilt / turn rate filter, s, and max change of the commanded turn rate, rad/s². */
-    rateFilter: 0.03,
-    rateAccel: 6,
-    /** How far the bank may exceed the coordinated angle of the tightest turn, rad. */
-    bankSlack: (10 * Math.PI) / 180,
-    /** Max body lean beyond the turn's apparent gravity, rad, and the extra a full lean commits. */
-    leanMargin: 0.1937,
-    sideMargin: 0.08,
-  },
-  /** COM fore/aft trim range, m. */
+  /** Support across the board: the toes / heels press the deck up to railInset (m) inside the
+   * working rail — the feet span the deck and the rider steps onto the rail being weighted. (The
+   * hull needs it: rolling a planing funboard through 10–30° of bank before the turn has built up
+   * takes ≈ 16 cm of CoP, the wider longboard / soft-top ≈ 24 cm; a foot centred on the stringer
+   * reaches ≈ 13 cm.) Foot width along the board, m (75 kg body). */
+  railInset: 0.03,
+  footWidth: 0.1,
+  /** Bank relative to the water surface under the board that a full leanSide edges toward, rad,
+   * and how fast that target moves, rad/s. */
+  bankMax: (40 * Math.PI) / 180,
+  bankRate: (90 * Math.PI) / 180,
+  /** Edge pressure (balanceReflex): the pressure that holds a carve, × the half width of the board
+   * at the feet, at the forward speed edgeSpeed (∝ v^1.5 below it), reached for a wanted bank of
+   * edgeHoldBank, rad; the largest bank-error correction on top of it, × the half width; the
+   * correction gains (reflex.edge / edgeDamp) scale as (v / edgeSpeed)^edgeSpeedExp below
+   * edgeSpeed, not below edgeSpeedMin. */
+  edgeHold: 0.5,
+  edgeHoldBank: (15 * Math.PI) / 180,
+  edgeFix: 0.6,
+  edgeSpeed: 7,
+  edgeSpeedExp: 3,
+  edgeSpeedMin: 0.15,
+  /** Expected turn (balanceReflex): u tilts by atan(turnCoord tan φ) for a bank φ on the water
+   * (a conservative share of the ≈ 0.4–0.7 these hulls show), fading in between the forward speeds
+   * turnSpeed, m/s, after turnLag, s. */
+  turnCoord: 0.3,
+  turnSpeed: [1.5, 3.5] as [number, number],
+  turnLag: 0.25,
+  /** How far beyond the usable support a lean may aim the body, m (the body leans into the turn
+   * that will catch it). */
+  commit: 0.08,
+  /** Felt hold: filter time constant of the CoP that balances the water's roll moment (0 = use
+   * the hold model), s. */
+  feltHold: 0,
+  /** Hip strategy: the trunk (upper body) as a rotor about the COM — its inertia, kg·m² per kg of
+   * a 75 kg-scaled body, the hip's torque, N·m per kg (× scale), the trunk's range, rad (the rider
+   * falls past twice that), and the frequency of its return to neutral, rad/s. */
+  hipInertia: 0.07,
+  hipTorque: 1.6,
+  hipRange: 0.4,
+  hipReturn: 3,
+  /** COM aim along the board at a full leanForward, m from the feet midpoint (trim). */
   trimRange: 0.22,
+  /** Nose-dive reflex: below this trim relative to the water surface along the board, rad, the
+   * rider moves back reflex.nose m per rad (+ noseDamp s × the nose-down pitch rate). */
+  noseTrim: (1 * Math.PI) / 180,
+  noseDamp: 0.3,
+  /** Balance reflex, [clumsy, skilled] by balanceAssist (see the file header):
+   *  gain: capture gain k, 1/s (the capture point converges at k, the COM at ω0 and k);
+   *  support: usable fraction of the feet (a clumsy rider does not dare the edges);
+   *  edge: edge pressure correction per radian of bank error, m/rad, edgeDamp per rad/s of roll rate;
+   *  crouch: crouch added as the capture point nears the edge of the feet (0..1);
+   *  hip: share of the hip torque used. */
+  reflex: {
+    gain: [1.5, 6] as [number, number],
+    support: [0.6, 0.95] as [number, number],
+    edge: [0.45, 0.99] as [number, number],
+    edgeDamp: [0.075, 0.165] as [number, number],
+    crouch: [0, 0] as [number, number],
+    hip: [0.3, 1] as [number, number],
+    nose: [0.5, 1.5] as [number, number],
+  },
+  /** How far the capture point may be beyond the edge of the feet and still be saved (arms, hips:
+   * the body's own angular momentum), m, and the body's tilt past the edge of the feet (from the
+   * apparent up) beyond which nothing brings it back, rad. */
+  recoverMargin: 0.03,
+  noReturn: (15 * Math.PI) / 180,
+  /** Friction angle of the feet on the waxed deck: a leg force further than this from the deck
+   * normal slips, rad (μ ≈ 0.84), for longer than slipTime, s. */
+  slipAngle: (40 * Math.PI) / 180,
+  slipTime: 0.15,
+  /** Floor on the apparent gravity used for the pendulum frequency (unweighted over a crest), × g. */
+  minApparentG: 0.3,
+  /** Crouch servo: rate of the COM height target, m/s, and its lag, s. */
+  crouchRate: 2,
+  crouchLag: 0.12,
   /** Twist (standing): the upper body (trunk, arms, head) is a yaw rotor about the deck normal,
    * driven against the board by the trunk muscles (torque ≤ twistTorque, N·m) toward
    * −twist × twistRange (rad) of counter-rotation (+ a stiff stop past the range); twistFreq is
@@ -142,37 +195,11 @@ export const RIDER_MODEL = {
   twistInertia: 0.018,
   twistRange: (70 * Math.PI) / 180,
   twistFreq: 18,
-  /** Stance controller lag (trim, height), s, and max rate, rad/s. */
-  stanceLag: 0.18,
-  stanceRate: 3,
-  /** Lean/pitch servo: natural frequency (rad/s), max COM acceleration (m/s²) and speed (m/s)
-   * relative to the feet. */
-  stanceFreq: 12,
-  stanceAccel: 7.975,
-  stanceSpeed: 1.6816,
-  /** Max rate of the fore/aft "gimbal" (the ankles absorbing the board pitching under the body),
-   * rad/s (riding peaks ≈ 2), and max speed of the COM target relative to the board, m/s (riding
-   * and pop-ups peak ≈ 1.7). */
-  gimbalRate: 3,
+  /** Max speed of the prone/pop-up COM target relative to the board, m/s (pop-ups peak ≈ 1.7). */
   targetSpeedMax: 4,
-  /** Feet lever arms for the ankle-torque limit, m (roll: how far across the stringer the foot
-   * pressure can move — in a carve the toes / heels press within ≈ 6 cm of the rail (the hull's own
-   * centre of pressure sits 16–22 cm off the stringer at 20–50° of bank, so a shorter lever cannot
-   * hold a carve); pitch: between the feet). */
-  rollLever: 0.2066,
-  pitchLever: 0.3,
-  /** Extra torque the feet can hold regardless of load, N·m. */
-  gripTorque: 10,
-  /** Recoverable tip of the body beyond what the feet can hold (roll, pitch), rad: further
-   * from the apparent up than asin(lever / leg length) + this, the rider falls. */
-  tipRoll: (10 * Math.PI) / 180,
-  tipPitch: (12 * Math.PI) / 180,
-  /** Leg stretch (rider COM from the stance target) that counts as an impact wipeout, m. */
+  /** Leg-axis stretch / squash (COM height off its target) that counts as an impact wipeout, m. */
   impactStretch: 0.45,
-  /** Leg stiffness across the board relative to the vertical/fore-aft stiffness (knees and
-   * hips let the board shift sideways under the rider instead of a rigid lever). */
-  lateralStiffness: 1,
-  /** Low-pass time constant of the ankle torque / feet load used by the balance check, s. */
+  /** Low-pass time constant of the feet load (HUD, telemetry), s. */
   balanceFilter: 0.1,
   /** Mean body density used for the segment volumes (wetsuit, lungs full), kg/m³. */
   bodyDensity: 990,
@@ -198,12 +225,9 @@ export const RIDER_MODEL = {
   /** Leash spring (beyond the slack length) N/m and damping N·s/m. */
   leashStiffness: 400,
   leashDamping: 80,
-  /** Apparent-gravity filter time constants, s: roll balance (fast) and fore/aft (slow; a fast
-   * fore/aft reflex pumps the planing pitch mode into porpoising). */
+  /** Apparent-gravity filter time constant (what the balance senses), s. */
   accelFilter: 0.08,
-  accelFilterPitch: 0.35,
-  /** Fraction of the fore/aft apparent-gravity tilt the assisted stance follows. */
-  pitchFollow: 0.7,
+
 };
 
 /** A buoyant spheroid body segment (radius ⟂ axis, halfLength along axis). */
@@ -306,7 +330,8 @@ export class Rider {
   /** Time since the wipeout, s. */
   timeSinceWipeout = 0;
 
-  /** Target COM in board local coordinates and its rate of change. */
+  /** Target COM in board local coordinates and its rate of change (prone / pop-up spring; standing:
+   * the aim point at the target height, for reference). */
   readonly targetLocal = new Vector3();
   readonly targetVelLocal = new Vector3();
   /** Stance up (feet → COM) in board local coordinates. */
@@ -314,34 +339,79 @@ export class Rider {
   readonly backFootLocal = new Vector3();
   readonly frontFootLocal = new Vector3();
   readonly feetMidLocal = new Vector3();
+  /** Support half-sizes in the deck plane around the feet midpoint: along the board (x) and
+   * across it (z), m. */
+  supportX = 0.34;
+  supportZ = 0.13;
+  /** Half width of the board at the feet (narrower foot), m. */
+  railZ = 0.25;
 
-  // stance controller state
-  /** Roll / pitch of the apparent up (g − a of the board + rider COM) in board axes, rad. */
-  rollApparent = 0;
-  pitchApparent = 0;
-  lean = 0;
-  leanRate = 0;
-  /** Body tilt: world roll of the feet → COM line about the heading (+ = right), rad, and its rate. */
-  bodyTilt = 0;
-  bodyTiltRate = 0;
-  /** Tilt of the apparent gravity due to the turn, atan(v·ω/g) (filtered), rad. */
+  // --- standing balance (see the file header). Frame vectors are world, refreshed every step.
+  /** Apparent up u, the board's long and lateral axes projected ⟂ u. */
+  readonly frameU = new Vector3(0, 1, 0);
+  readonly frameX = new Vector3(1, 0, 0);
+  readonly frameZ = new Vector3(0, 0, 1);
+  /** |a + g|, m/s² (filtered), and the pendulum frequency ω0, rad/s. */
+  apparentG = GRAVITY;
+  omega0 = 3.2;
+  /** COM relative to the feet midpoint: height along u, offsets along e_x / e_z (m) and the
+   * relative velocity along e_x / e_z / u (m/s). */
+  comHeight = 0.95;
+  comX = 0;
+  comZ = 0;
+  comVX = 0;
+  comVZ = 0;
+  comVU = 0;
+  /** Capture point (e_x, e_z), m. */
+  captureX = 0;
+  captureZ = 0;
+  /** Velocity of the aim point relative to the feet along e_x / e_z (it turns with the board's yaw
+   * about the water's normal and moves with the lean), m/s. */
+  aimVelX = 0;
+  aimVelZ = 0;
+  /** Hip strategy: the trunk (upper body) as a bounded rotor about the COM. Its angle (rad, + = the
+   * upper body toward +e_x / +e_z) and rate, and the moment of the leg force about the COM this
+   * step (N·m, + = pushing the COM toward +e_x / +e_z: the trunk swings the other way). */
+  trunkX = 0;
+  trunkZ = 0;
+  /** Moment of the leg force pair about u over the last step (+ = about +u), N·m. */
+  legYawMoment = 0;
+  trunkVX = 0;
+  trunkVZ = 0;
+  hipX = 0;
+  hipZ = 0;
+  /** Centroidal moment pivot the balance law asks for (CoP − hip moment / load), m, and whether
+   * it is out of reach (CoP at the edge of the feet and the hip at its limit). */
+  cmpX = 0;
+  cmpZ = 0;
+  /** Tilt of u across the board that the rider expects from the turn (lags the bank), rad. */
   turnTilt = 0;
-  private hasBodyTilt = false;
-  /** Assisted bank target relative to the water surface, rad. */
-  bankTargetRel = 0;
-  /** Commanded turn rate (+ = right) and its filtered measurement, rad/s. */
-  turnRateTarget = 0;
-  turnRateF = 0;
-  pitchRate = 0;
-  /** Servoed part of the stance pitch, rad, and the slow part of the apparent-up pitch. */
-  private pitchSlow = 0;
-  private pitchGimbal = 0;
-  private pitchAppLF = 0;
-  private hasPitchLF = false;
+  /** Reflex aim (where the capture point is driven) and the commanded CoP, m. */
+  aimX = 0;
+  aimZ = 0;
+  copX = 0;
+  copZ = 0;
+  /** The CoP command is at the edge of the usable support (along / across). */
+  copSatX = false;
+  copSatZ = false;
+  /** Usable support (projected ⟂ u), and the whole support projected, m. */
+  usableX = 0.3;
+  usableZ = 0.12;
+  footX = 0.34;
+  footZ = 0.13;
+  /** Capture gain k of the reflex this step, 1/s. */
+  captureGain = 3;
+  /** COM height target along u and its rate, m, m/s. */
+  heightTarget = 0.95;
+  heightRate = 0;
+  /** Bank the rider edges toward (relative to the water) and the target bank (world), rad. */
+  bankCmd = 0;
+  bankTarget = 0;
+  /** Angle between the leg force line (≈ u) and the deck normal, rad. */
+  deckAngle = 0;
+
   /** Board bank (world roll of its lateral axis, right rail down +), rad. */
   bankAngle = 0;
-  /** Bank the assisted rider is steering toward, rad. */
-  bankTarget = 0;
   /** Board turn rate (+ = right), rad/s. */
   turnRate = 0;
   /** Water surface slope under the board (set by SurfSim each step). */
@@ -349,30 +419,32 @@ export class Rider {
   waterSlopeZ = 0;
   /** Bank that would lie flat on the water surface, rad. */
   waterBank = 0;
-  pitch = 0;
-  trim = 0;
+  /** Water velocity under the board (set by SurfSim each step), m/s. */
+  waterVelX = 0;
+  waterVelY = 0;
+  waterVelZ = 0;
+  /** Water roll moment on the board about the feet line (+ = right rail down), set by SurfSim each
+   * step, N·m. */
+  hullRollMoment = 0;
+  feltHold = 0;
+  /** Body lean toward the right rail relative to the deck normal (pose), rad. */
+  lean = 0;
   height = 0.95;
   proneShift = 0;
   proneSide = 0;
 
-  // balance
-  /** Ankle torque / what the feet can hold, roll and pitch (signed; |x| > 1 = slipping). */
+  // balance read-out
+  /** Capture point relative to the support + recovery margin, along the lateral (roll) and
+   * long (pitch) axes: |x| > 1 = past recovery (the HUD's balance dot). */
   balanceRoll = 0;
   balancePitch = 0;
-  /** Body tipped over the edge of the feet away from the stance target (roll, pitch), rad. */
-  tipRoll = 0;
-  tipPitch = 0;
   /** Which way the body went past recovery in the last balance check (null = in balance). */
   tipOver: 'side' | 'forward' | 'back' | null = null;
-  /** Seconds spent over the ankle limit (decays when back in balance). */
+  /** Seconds the capture point has spent past recovery (decays when back in balance). */
   balanceTimer = 0;
   /** Normal force of the feet on the deck (low-passed), N. */
   feetLoad = 0;
-  /** Ankle torque about the board's long axis (roll) and lateral axis (pitch), low-passed, N·m. */
-  ankleRoll = 0;
-  anklePitch = 0;
-  /** An ankle (roll or pitch) is at its torque limit this step: the body is tipping over the
-   * edge of the feet. */
+  /** The CoP is at the edge of the usable support this step. */
   ankleSaturated = false;
   /** Upper-body twist relative to the board about the deck normal (+ = toward the right, like
    * turnRate), rad, and the upper body's yaw rate about the deck normal (+ = right), rad/s
@@ -381,13 +453,12 @@ export class Rider {
   twistSpin = 0;
   /** Leg force on the rider (effective, from the implicit step), world. */
   readonly legForce = new Vector3();
-  /** Filtered board + rider COM acceleration (apparent gravity for roll balance), world. */
+  /** Filtered board + rider COM acceleration (apparent gravity), world. */
   readonly accelFiltered = new Vector3();
-  /** Slowly filtered acceleration (fore/aft balance), world. */
-  readonly accelSlow = new Vector3();
   private flipTimer = 0;
   private pearlTimer = 0;
   private buriedTimer = 0;
+  private slipTimer = 0;
 
   // paddling
   /** Arm stroke phases 0..1 (pull during the first 45 %). */
@@ -415,9 +486,11 @@ export class Rider {
   private proneBase = new Vector3();
   private readonly tmp = new Vector3();
   private readonly tmp2 = new Vector3();
-  private readonly tmp3 = new Vector3();
   private readonly prevTarget = new Vector3();
+  private readonly popInput: StanceInput = { paddle: 0, steer: 0, leanForward: 0, leanSide: 0, crouch: 0 };
   private hasPrevTarget = false;
+  /** Board-local point the attached segment layout is relative to. */
+  private readonly segRefLocal = new Vector3();
 
   constructor(config: Partial<RiderConfig> = {}) {
     this.config = { ...DEFAULT_RIDER_CONFIG, ...config };
@@ -457,6 +530,7 @@ export class Rider {
     // person in a wetsuit with air in the lungs, so a fallen rider just floats
     const total = this.config.mass / RIDER_MODEL.bodyDensity;
     for (let i = 0; i < SEGMENTS.length; i++) this.segments[i].volume = total * SEGMENTS[i].frac;
+    if (this.shape) this.setBoard(this.shape);
   }
 
   /** Body length scale relative to the 75 kg reference rider. */
@@ -489,6 +563,12 @@ export class Rider {
     this.frontFootLocal.set(shape.x(uf), shape.deckY(uf, 0), 0);
     this.feetMidLocal.addVectors(this.backFootLocal, this.frontFootLocal).multiplyScalar(0.5);
     this.proneBase.set(shape.centerOfVolume.x + st.proneOffset, 0, 0);
+    // support: the deck under the feet (railInset inside the rails across, the feet's own width
+    // beyond the feet along)
+    const s = this.scale;
+    this.supportX = 0.5 * st.feetSpread + 0.5 * RIDER_MODEL.footWidth * s;
+    this.railZ = Math.min(shape.halfWidth(ub), shape.halfWidth(uf));
+    this.supportZ = Math.max(this.railZ - RIDER_MODEL.railInset, 0.05);
   }
 
   /** Reset the controller state for a stance (does not place the rider; SurfSim does). */
@@ -498,43 +578,37 @@ export class Rider {
     this.wipeoutReason = null;
     this.timeSinceWipeout = 0;
     this.lean = 0;
-    this.leanRate = 0;
-    this.bodyTilt = 0;
-    this.bodyTiltRate = 0;
-    this.turnTilt = 0;
-    this.hasBodyTilt = false;
-    this.bankTargetRel = 0;
-    this.turnRateTarget = 0;
-    this.turnRateF = 0;
-    this.pitch = 0;
-    this.pitchSlow = 0;
-    this.pitchGimbal = 0;
-    this.pitchAppLF = 0;
-    this.hasPitchLF = false;
-    this.pitchRate = 0;
-    this.trim = 0;
     this.height = this.config.standHeight;
+    this.heightTarget = this.config.standHeight * this.scale;
+    this.heightRate = 0;
     this.proneShift = 0;
     this.proneSide = 0;
+    this.bankCmd = 0;
     this.balanceRoll = 0;
     this.balancePitch = 0;
     this.balanceTimer = 0;
     this.tipOver = null;
-    this.tipRoll = 0;
-    this.tipPitch = 0;
-    this.ankleRoll = 0;
-    this.anklePitch = 0;
     this.feetLoad = 0;
     this.flipTimer = 0;
     this.pearlTimer = 0;
     this.buriedTimer = 0;
+    this.slipTimer = 0;
+    this.captureX = this.captureZ = 0;
+    this.aimX = this.aimZ = 0;
+    this.copX = this.copZ = 0;
+    this.copSatX = this.copSatZ = false;
     // start mid-pull: the first stroke's yaw impulse is then half of a full one and the yaw rate
     // swings symmetrically about zero instead of leaving a ~10° heading offset
     this.armPhaseL = 0.225;
     this.armPhaseR = 0.725;
     this.paddleThrust = 0;
     this.accelFiltered.set(0, 0, 0);
-    this.accelSlow.set(0, 0, 0);
+    this.aimVelX = this.aimVelZ = 0;
+    this.trunkX = this.trunkZ = this.trunkVX = this.trunkVZ = 0;
+    this.hipX = this.hipZ = 0;
+    this.cmpX = this.cmpZ = 0;
+    this.turnTilt = 0;
+    this.feltHold = 0;
     this.legForce.set(0, 0, 0);
     this.twistAngle = 0;
     this.twistSpin = 0;
@@ -543,15 +617,10 @@ export class Rider {
   }
 
   /**
-   * Restart the rate estimators (body tilt rate, turn rate, apparent gravity) and pre-load the
-   * feet with the rider's weight. Call after the rider and board were placed (a spawn).
+   * Restart the estimators (apparent gravity) and pre-load the feet with the rider's weight. Call
+   * after the rider and board were placed (a spawn).
    */
   restartEstimators(): void {
-    this.hasBodyTilt = false;
-    this.bodyTiltRate = 0;
-    this.turnTilt = 0;
-    this.turnRateF = 0;
-    this.hasPitchLF = false;
     this.feetLoad = this.stance === 'standing' ? this.config.mass * GRAVITY : 0;
   }
 
@@ -574,19 +643,23 @@ export class Rider {
     this.fallenDir.normalize();
   }
 
-  /** Rider body moment of inertia about its own COM, in board axes, for the current stance (the
-   * part that turns with the board: standing, the upper body's yaw is its own DOF). */
+  /** Rider body moment of inertia about its own COM that turns with the board, board axes. Prone
+   * (lying on the deck) and popping up it is the whole body; standing only the yaw (the feet hold
+   * the body's heading; the upper body's own yaw is the twist DOF) — in roll and pitch the board
+   * turns under the feet and the body is the pendulum above them. */
   bodyInertia(out: Vector3): Vector3 {
     if (this.stance === 'fallen') return out.set(0, 0, 0);
     const m = this.config.mass;
     const s2 = this.scale * this.scale;
     // prone: body along x (L ≈ 1.75 m) → small roll, large yaw/pitch
     const px = 0.045 * m * s2, py = 0.24 * m * s2, pz = 0.24 * m * s2;
-    // standing: body along y → yaw small, roll/pitch ≈ m (0.35 m)²
-    const sx = 0.11 * m * s2, sy = 0.025 * m * s2, sz = 0.11 * m * s2;
+    // standing: body along y → yaw small
+    const sy = 0.025 * m * s2;
+    if (this.stance === 'standing') return out.set(0, sy - this.twistInertia(), 0);
     const w = this.standWeight();
-    const twist = this.stance === 'standing' ? this.twistInertia() : 0;
-    return out.set(px + (sx - px) * w, py + (sy - py) * w - twist, pz + (sz - pz) * w);
+    // popping: crouched over the board, still held through hands and feet
+    const sx = 0.11 * m * s2, sz = 0.11 * m * s2;
+    return out.set(px + (sx - px) * w, py + (sy - py) * w, pz + (sz - pz) * w);
   }
 
   /** Yaw inertia of the upper body (the twist rotor), kg·m². */
@@ -630,8 +703,8 @@ export class Rider {
   }
 
   /**
-   * Advance the stance controller and pop-up, and compute the target COM (board local) and the
-   * board-local segment layout. `board` must have its derived matrices up to date.
+   * Advance the pop-up, the stance and the balance reflex, and compute the target COM (board
+   * local) and the board-local segment layout. `board` must have its derived matrices up to date.
    */
   updateTargets(dt: number, input: StanceInput, board: RigidBody): void {
     const cfg = this.config;
@@ -652,166 +725,90 @@ export class Rider {
         this.twistSpin = boardYawRate(board);
       }
     }
-
-    // apparent up in board axes (filtered acceleration of the board + rider COM). The angles are
-    // atan(component / max(up·deck normal, 0.5)): exact while the board is within 60° of the
-    // apparent up, and continuous beyond (with the apparent up behind the deck — board on its side
-    // or upside down — a plain atan2 wraps through ±π and flips the stance target in one step)
-    const af = this.accelFiltered;
-    this.tmp.set(af.x, af.y + GRAVITY, af.z);
-    if (this.tmp.lengthSq() < 1) this.tmp.set(0, 1, 0);
-    this.tmp.normalize();
-    board.worldDirToLocal(this.tmp, this.tmp2);
-    this.rollApparent = clamp(Math.atan2(this.tmp2.z, Math.max(this.tmp2.y, 0.5)), -1.2, 1.2);
-    const as = this.accelSlow;
-    this.tmp.set(as.x, as.y + GRAVITY, as.z);
-    if (this.tmp.lengthSq() < 1) this.tmp.set(0, 1, 0);
-    this.tmp.normalize();
-    board.worldDirToLocal(this.tmp, this.tmp2);
-    this.pitchApparent = clamp(Math.atan2(this.tmp2.x, Math.max(this.tmp2.y, 0.5)), -0.6, 0.6);
-    // its slow part (board trim, sustained acceleration); the rest is the board pitching under the
-    // rider (chop), which the ankles absorb with the body steady
-    if (!this.hasPitchLF) {
-      this.pitchAppLF = this.pitchApparent;
-      this.hasPitchLF = true;
-    }
-    this.pitchAppLF += (this.pitchApparent - this.pitchAppLF) * (1 - Math.exp(-dt / M.accelFilterPitch));
+    const R = board.R;
+    const av = board.angularVelocity;
+    this.turnRate = -av.y; // + = turning right (toward +Z when heading +X)
+    this.bankAngle = Math.asin(clamp(-R[5], -1, 1));
+    // water surface across the board: bank that would lie flat on it
+    const zh = Math.hypot(R[2], R[8]) || 1;
+    const sLat = (this.waterSlopeX * R[2] + this.waterSlopeZ * R[8]) / zh;
+    this.waterBank = -Math.atan(sLat);
 
     // --- prone target
     const lagK = 1 - Math.exp(-dt / 0.25);
     this.proneShift += (clamp(input.leanForward, -1, 1) * 0.15 - this.proneShift) * lagK;
     // prone balance reflex: shift the body toward the high rail (keeps a sunken board upright)
-    const sideTarget = clamp(input.leanSide, -1, 1) * 0.05 + clamp(cfg.balanceAssist, 0, 1) * clamp(0.5 * this.rollApparent, -0.12, 0.12);
-    this.proneSide += (sideTarget - this.proneSide) * lagK;
+    {
+      const af = this.accelFiltered;
+      this.tmp.set(af.x, af.y + GRAVITY, af.z);
+      if (this.tmp.lengthSq() < 1) this.tmp.set(0, 1, 0);
+      board.worldDirToLocal(this.tmp.normalize(), this.tmp2);
+      const rollApparent = clamp(Math.atan2(this.tmp2.z, Math.max(this.tmp2.y, 0.5)), -1.2, 1.2);
+      const sideTarget = clamp(input.leanSide, -1, 1) * 0.05 + clamp(cfg.balanceAssist, 0, 1) * clamp(0.5 * rollApparent, -0.12, 0.12);
+      this.proneSide += (sideTarget - this.proneSide) * lagK;
+    }
     const pxl = this.proneBase.x + this.proneShift;
     const pu = clamp(shape.uAtX(pxl), 0, 1);
     const pTx = pxl;
     const pTy = shape.deckY(pu, 0) + cfg.proneHeight;
     const pTz = this.proneSide;
 
-    // --- standing target
-    const a = clamp(cfg.balanceAssist, 0, 1);
-    const pitchApp = this.pitchApparent;
-    // Roll. The assisted rider (a skilled rider's reflexes) carves by banking the board: leanSide
-    // asks for a turn; the target bank (relative to the water surface under the board) ramps
-    // toward side·bankMax at bankRate. The lean of the body relative to the deck is set by a
-    // reflex that (1) follows the apparent gravity g − a (a coordinated lean is free), (2) leans
-    // into the intended turn (feed-forward), (3) pushes the bank toward its target, (4) centres the
-    // foot pressure (ankle torque) and (5) damps the body's roll rate. Gains are scheduled on the
-    // speed through the water (a planing hull turns, a slow one does not). Whether the lean is
-    // actually held is up to the physics: the ankles are torque-limited (SurfSim) and leaning that
-    // the turn does not support tips the body over.
-    // The raw rider (assist 0) just leans relative to the deck.
-    const side = clamp(input.leanSide, -1, 1);
-    const R = board.R;
-    const av = board.angularVelocity;
-    const bank = Math.asin(clamp(-R[5], -1, 1));
-    const bankRate = av.x * R[0] + av.y * R[3] + av.z * R[6];
-    const vh = Math.hypot(board.velocity.x, board.velocity.z);
-    const turnRate = -av.y; // + = turning right (toward +Z when heading +X)
-    this.turnRate = turnRate;
-    this.bankAngle = bank;
-    // water surface across the board: bank that would lie flat on it
-    const zh = Math.hypot(R[2], R[8]) || 1;
-    const sLat = (this.waterSlopeX * R[2] + this.waterSlopeZ * R[8]) / zh;
-    const waterBank = -Math.atan(sLat);
-    this.waterBank = waterBank;
-    // body tilt (world roll of feet → COM about the heading) and its rate
-    {
-      const fm0 = this.feetMidLocal;
-      const fx = board.position.x + R[0] * fm0.x + R[1] * fm0.y + R[2] * fm0.z;
-      const fy = board.position.y + R[3] * fm0.x + R[4] * fm0.y + R[5] * fm0.z;
-      const fz = board.position.z + R[6] * fm0.x + R[7] * fm0.y + R[8] * fm0.z;
-      const hx = R[0] / zh, hz = R[6] / zh;
-      const lat = -hz * (this.position.x - fx) + hx * (this.position.z - fz);
-      const bt = Math.atan2(lat, this.position.y - fy);
-      if (this.hasBodyTilt) this.bodyTiltRate += ((bt - this.bodyTilt) / dt - this.bodyTiltRate) * (1 - Math.exp(-dt / M.carve.rateFilter));
-      this.bodyTilt = bt;
-      this.hasBodyTilt = true;
-    }
-    const C = M.carve;
-    // tilt of the apparent gravity from the turn (centripetal acceleration v·ω), filtered
-    const tk = Math.atan((vh * turnRate) / GRAVITY);
-    this.turnTilt += (tk - this.turnTilt) * (1 - Math.exp(-dt / C.rateFilter));
-    // leanSide asks for a turn rate (up to the tightest turn the board holds at this speed, radius
-    // minTurnRadius); the rider banks the board (relative to the water surface) by the coordinated
-    // angle of that turn, corrected by the turn-rate error and by balance steering (the body
-    // tipping off the turn's apparent gravity)
-    const vt = Math.max(vh, 1);
-    const rateMax = Math.min(vt / M.minTurnRadius, M.turnRateMax);
-    this.turnRateTarget += clamp(side * rateMax - this.turnRateTarget, -C.rateAccel * dt, C.rateAccel * dt);
-    this.turnRateF += (turnRate - this.turnRateF) * (1 - Math.exp(-dt / C.rateFilter));
-    const rateErr = this.turnRateTarget - this.turnRateF;
-    const bankCap = Math.min(M.bankMax, Math.atan((vt * vt) / (M.minTurnRadius * GRAVITY)) + C.bankSlack);
-    const bankFf = Math.atan((vt * this.turnRateTarget) / GRAVITY);
-    const steerB = C.steer * (this.bodyTilt - this.turnTilt) + C.steerD * this.bodyTiltRate;
-    this.bankTargetRel = clamp(bankFf + C.rateP * rateErr + steerB, -bankCap, bankCap);
-    const bankTarget = waterBank + this.bankTargetRel;
-    this.bankTarget = bankTarget;
-    // the lean reflex: follow the turn's apparent gravity, lean toward the target bank (the ankle
-    // torque that rolls the board), centre the foot pressure, damp the body and board roll
-    const lean0 = clamp(
-      C.turn * (this.turnTilt - this.bodyTilt) +
-        C.ff * this.bankTargetRel +
-        C.p * (bankTarget - bank) -
-        C.bal * clamp(this.balanceRoll, -2, 2) -
-        C.d * this.bodyTiltRate -
-        C.phiD * bankRate,
-      -1,
-      1,
-    );
-    // never lean the body more than leanMargin beyond the apparent gravity of the turn (the
-    // ankles cannot hold it; it would only tip the rider over the edge of the feet); a full lean
-    // commits a little further
-    const margin = C.leanMargin + C.sideMargin * side * side;
-    const assisted = clamp(lean0, this.turnTilt - margin - bank, this.turnTilt + margin - bank);
-    const raw = (1 - a) * (1 - a);
-    const leanTarget = a * assisted + raw * side * M.leanRaw;
-    // pitch: follow the slow part of the apparent gravity fore/aft (pitchFollow of it: a full
-    // reflex pumps the planing pitch mode), while the ankles absorb the board pitching under the
-    // body over chop (the fast part, "gimbal": the body stays steady in the world)
-    const pitchTarget = a * M.pitchFollow * this.pitchAppLF;
-    // (rate-limited: the body cannot follow an arbitrarily fast board pitch either)
-    this.pitchGimbal += clamp(a * (pitchApp - this.pitchAppLF) - this.pitchGimbal, -M.gimbalRate * dt, M.gimbalRate * dt);
-    const trimTarget = clamp(input.leanForward, -1, 1) * M.trimRange;
-    const hTarget = cfg.standHeight + (cfg.crouchHeight - cfg.standHeight) * clamp(input.crouch, 0, 1);
-    const k = 1 - Math.exp(-dt / M.stanceLag);
-    // the COM moves relative to the feet like a body (bounded acceleration and speed), not a
-    // stepping target: a critically damped 2nd-order servo on the lean and pitch angles
-    {
-      const wn = M.stanceFreq;
-      const aMax = M.stanceAccel / Math.max(this.height * s, 0.3);
-      const vMax = M.stanceSpeed / Math.max(this.height * s, 0.3);
-      let acc = wn * wn * (leanTarget - this.lean) - 2 * wn * this.leanRate;
-      this.leanRate = clamp(this.leanRate + clamp(acc, -aMax, aMax) * dt, -vMax, vMax);
-      this.lean += this.leanRate * dt;
-      acc = wn * wn * (pitchTarget - this.pitchSlow) - 2 * wn * this.pitchRate;
-      this.pitchRate = clamp(this.pitchRate + clamp(acc, -aMax, aMax) * dt, -vMax, vMax);
-      this.pitchSlow += this.pitchRate * dt;
-      this.pitch = this.pitchSlow + this.pitchGimbal;
-    }
-    this.trim += clamp((trimTarget - this.trim) * k, -1.5 * dt, 1.5 * dt);
-    this.height += clamp((hTarget - this.height) * k, -2 * dt, 2 * dt);
-
-    const cp = Math.cos(this.pitch);
-    const ux = Math.sin(this.pitch);
-    const uy = cp * Math.cos(this.lean);
-    const uz = cp * Math.sin(this.lean);
-    const h = this.height * s;
+    // --- standing: balance reflex (also gives the pop-up its end target)
+    // (getting up, the rider does not edge yet: hands and feet are still finding the deck)
+    if (this.stance === 'popping') {
+      const pi = this.popInput;
+      pi.paddle = input.paddle;
+      pi.steer = input.steer;
+      pi.leanForward = input.leanForward;
+      pi.leanSide = 0;
+      pi.crouch = input.crouch;
+      this.balanceReflex(dt, pi, board);
+    } else this.balanceReflex(dt, input, board);
     const fm = this.feetMidLocal;
-    const sTx = fm.x + this.trim + h * ux;
-    const sTy = fm.y + h * uy;
-    const sTz = fm.z + h * uz;
+    // aim point at the target height, board local. Getting up (a stiff hands-and-feet push, not
+    // yet the balancing body) the rider rises along the water's normal — following the apparent
+    // up there would feed the board's own lurches straight back into the push
+    if (this.stance === 'popping') {
+      const n = this.tmp.set(-this.waterSlopeX, 1, -this.waterSlopeZ).normalize();
+      // trim along the board, ⟂ n
+      const R = board.R;
+      const d = R[0] * n.x + R[3] * n.y + R[6] * n.z;
+      const ax = R[0] - d * n.x, ay = R[3] - d * n.y, az = R[6] - d * n.z;
+      const al = Math.hypot(ax, ay, az) || 1;
+      n.multiplyScalar(this.heightTarget);
+      this.tmp.set(n.x + (ax / al) * this.aimX, n.y + (ay / al) * this.aimX, n.z + (az / al) * this.aimX);
+    } else this.tmp.copy(this.frameU).multiplyScalar(this.heightTarget).addScaledVector(this.frameX, this.aimX).addScaledVector(this.frameZ, this.aimZ);
+    board.worldDirToLocal(this.tmp, this.tmp2);
+    const sTx = fm.x + this.tmp2.x;
+    const sTy = fm.y + this.tmp2.y;
+    const sTz = fm.z + this.tmp2.z;
 
     // --- blend
     const w = this.standWeight();
     this.targetLocal.set(pTx + (sTx - pTx) * w, pTy + (sTy - pTy) * w, pTz + (sTz - pTz) * w);
-    this.upLocal.set(ux * w, 1 + (uy - 1) * w, uz * w).normalize();
     // (bounded to a body-plausible speed: the leg damper pushes c × this)
     if (this.hasPrevTarget) this.targetVelLocal.subVectors(this.targetLocal, this.prevTarget).divideScalar(dt).clampLength(0, M.targetSpeedMax);
     else this.targetVelLocal.set(0, 0, 0);
     this.prevTarget.copy(this.targetLocal);
     this.hasPrevTarget = true;
+
+    // standing body (board local): standing, the actual COM; popping up, the standing target. The
+    // segments are laid out around it (layoutSegments carries the layout with the actual COM)
+    const S = this.segRefLocal;
+    if (this.stance === 'standing') board.worldToLocal(this.position, S);
+    else S.set(sTx, sTy, sTz);
+    let ux = S.x - fm.x, uy = S.y - fm.y, uz = S.z - fm.z;
+    const hh = Math.sqrt(ux * ux + uy * uy + uz * uz);
+    if (hh > 1e-3) {
+      ux /= hh; uy /= hh; uz /= hh;
+    } else {
+      ux = 0; uy = 1; uz = 0;
+    }
+    // pose: stance up blended from the deck normal while popping up
+    this.upLocal.set(ux * w, 1 + (uy - 1) * w, uz * w).normalize();
+    this.lean = Math.atan2(uz, uy);
+    this.height = Math.min(this.heightTarget, hh) / s;
+    if (this.stance !== 'standing') S.copy(this.targetLocal);
 
     // --- segment layout (board local)
     for (let i = 0; i < SEGMENTS.length; i++) {
@@ -826,16 +823,17 @@ export class Rider {
       // standing spheroid: long axis along the limb / stance up
       const sa = d.sa * s;
       const sc = vol / ((4 / 3) * Math.PI * sa * sa);
+      const cx = fm.x + hh * ux, cy = fm.y + hh * uy, cz = fm.z + hh * uz;
       let slx: number, sly: number, slz: number;
       let ax: number, ay: number, az: number;
       if (d.anchor === 'com') {
-        slx = sTx + d.t * s * ux;
-        sly = sTy + d.t * s * uy;
-        slz = sTz + d.t * s * uz + d.pz * 0.9 * s;
+        slx = cx + d.t * s * ux;
+        sly = cy + d.t * s * uy;
+        slz = cz + d.t * s * uz + d.pz * 0.9 * s;
         ax = ux; ay = uy; az = uz;
       } else {
         const foot = d.anchor === 'back' ? this.backFootLocal : this.frontFootLocal;
-        const dx = sTx - foot.x, dy = sTy - foot.y, dz = sTz - foot.z;
+        const dx = cx - foot.x, dy = cy - foot.y, dz = cz - foot.z;
         slx = foot.x + d.t * dx;
         sly = foot.y + d.t * dy;
         slz = foot.z + d.t * dz + (d.name.endsWith('L') ? -0.06 : 0.06) * s;
@@ -849,7 +847,248 @@ export class Rider {
     }
   }
 
-  /** Update the filtered board acceleration (call once per step with the board's velocity change). */
+  /**
+   * The standing balance reflex (file header): frame, capture point, aim (edge pressure for the
+   * wanted bank, trim), CoP command and COM height target. Uses the current rider and board state.
+   */
+  private balanceReflex(dt: number, input: StanceInput, board: RigidBody): void {
+    const M = RIDER_MODEL;
+    const cfg = this.config;
+    const a = clamp(cfg.balanceAssist, 0, 1);
+    const R = board.R;
+    const s = this.scale;
+    // apparent up and its magnitude
+    const af = this.accelFiltered;
+    const U = this.frameU.set(af.x, af.y + GRAVITY, af.z);
+    let g = U.length();
+    if (g < 1e-3) {
+      U.set(0, 1, 0);
+      g = 0;
+    } else U.divideScalar(g);
+    this.apparentG = g;
+    // board long / lateral axes ⟂ u
+    const bxx = R[0], bxy = R[3], bxz = R[6];
+    const bzx = R[2], bzy = R[5], bzz = R[8];
+    const X = this.frameX;
+    let d = bxx * U.x + bxy * U.y + bxz * U.z;
+    X.set(bxx - d * U.x, bxy - d * U.y, bxz - d * U.z);
+    if (X.lengthSq() < 1e-8) X.set(-bzy * U.z + bzz * U.y, -bzz * U.x + bzx * U.z, -bzx * U.y + bzy * U.x);
+    X.normalize();
+    const Z = this.frameZ.crossVectors(X, U).normalize();
+    // projection of the support onto the plane ⟂ u
+    const cx = Math.abs(bxx * X.x + bxy * X.y + bxz * X.z);
+    const cz = Math.abs(bzx * Z.x + bzy * Z.y + bzz * Z.z);
+    this.footX = this.supportX * cx;
+    this.footZ = this.supportZ * cz;
+    const use = skill(M.reflex.support, a);
+    this.usableX = use * this.footX;
+    this.usableZ = use * this.footZ;
+    // deck normal vs. the leg force line (≈ u): past the friction angle the feet slip
+    this.deckAngle = Math.acos(clamp(R[1] * U.x + R[4] * U.y + R[7] * U.z, -1, 1));
+
+    // COM relative to the feet midpoint (position and velocity)
+    const fm = this.feetMidLocal;
+    const rfx = R[0] * fm.x + R[1] * fm.y + R[2] * fm.z;
+    const rfy = R[3] * fm.x + R[4] * fm.y + R[5] * fm.z;
+    const rfz = R[6] * fm.x + R[7] * fm.y + R[8] * fm.z;
+    const rx = this.position.x - board.position.x - rfx;
+    const ry = this.position.y - board.position.y - rfy;
+    const rz = this.position.z - board.position.z - rfz;
+    const w = board.angularVelocity;
+    const vx = this.velocity.x - (board.velocity.x + w.y * rfz - w.z * rfy);
+    const vy = this.velocity.y - (board.velocity.y + w.z * rfx - w.x * rfz);
+    const vz = this.velocity.z - (board.velocity.z + w.x * rfy - w.y * rfx);
+    this.comHeight = rx * U.x + ry * U.y + rz * U.z;
+    this.comX = rx * X.x + ry * X.y + rz * X.z;
+    this.comZ = rx * Z.x + ry * Z.y + rz * Z.z;
+    const h = Math.max(this.comHeight, 0.3 * s);
+    const w0 = Math.sqrt(Math.max(g, M.minApparentG * GRAVITY) / h);
+    this.omega0 = w0;
+    // the aim turns with the board about the water's normal n (the feet carry the body round the
+    // turn; the board's roll and pitch turn under the feet): its velocity relative to the feet,
+    // ω_n × r with ω_n = (ω·n) n
+    const nInv = 1 / Math.sqrt(1 + this.waterSlopeX * this.waterSlopeX + this.waterSlopeZ * this.waterSlopeZ);
+    const nx = -this.waterSlopeX * nInv, ny = nInv, nz = -this.waterSlopeZ * nInv;
+    const wn = w.x * nx + w.y * ny + w.z * nz;
+    const fvx = wn * (ny * rz - nz * ry), fvy = wn * (nz * rx - nx * rz), fvz = wn * (nx * ry - ny * rx);
+    const frameVX = fvx * X.x + fvy * X.y + fvz * X.z;
+    const frameVZ = fvx * Z.x + fvy * Z.y + fvz * Z.z;
+    let aimVX = frameVX;
+    let aimVZ = frameVZ;
+
+    // --- across: edge pressure toward the bank the rider wants (relative to the water surface)
+    const side = clamp(input.leanSide, -1, 1);
+    {
+      const step = M.bankRate * dt;
+      this.bankCmd += clamp(side * M.bankMax - this.bankCmd, -step, step);
+    }
+    this.bankTarget = this.waterBank + this.bankCmd;
+    const vf = Math.max(board.velocity.x * bxx + board.velocity.y * bxy + board.velocity.z * bxz, 0);
+    const vRel = clamp(vf / M.edgeSpeed, 0, 1);
+    // the turn the rider expects: banked φ on the water a planing board turns so that u tilts by
+    // about atan(κ tan φ), after a lag. The aim (fixed in the u frame) moves with that tilt — the
+    // body leans with the building turn instead of trailing it (no further than the wanted bank)
+    {
+      const kc = M.turnCoord * clamp((vf - M.turnSpeed[0]) / (M.turnSpeed[1] - M.turnSpeed[0]), 0, 1);
+      const cmd = this.bankCmd;
+      const phi = clamp(this.bankAngle - this.waterBank, Math.min(0, cmd), Math.max(0, cmd));
+      const rate = (Math.atan(kc * Math.tan(phi)) - this.turnTilt) / M.turnLag;
+      this.turnTilt += rate * dt;
+      aimVZ += h * rate;
+    }
+    // the pressure that holds a carve (the hull's roll moment is about constant over 15–45° of
+    // bank and grows with speed), plus a bounded correction for the bank error and the roll rate:
+    // a big error is closed by the hold pressure following the wanted bank, not by throwing the
+    // weight across (that would first press the other way). The correction gains fall with speed
+    // (a slow hull rolls more for the same pressure), not below edgeSpeedMin (a slow board still
+    // answers a hard lean: it tips)
+    {
+      const sched = Math.max(Math.pow(vRel, M.edgeSpeedExp), M.edgeSpeedMin);
+      let hold = M.edgeHold * this.railZ * Math.pow(vRel, 1.5) * clamp(this.bankCmd / M.edgeHoldBank, -1, 1);
+      if (M.feltHold > 0) {
+        const load = cfg.mass * Math.max(g, M.minApparentG * GRAVITY);
+        this.feltHold += (clamp(-this.hullRollMoment / load, -this.footZ, this.footZ) - this.feltHold) * (1 - Math.exp(-dt / M.feltHold));
+        hold = this.feltHold;
+      }
+      const rollRate = w.x * bxx + w.y * bxy + w.z * bxz;
+      const fix = skill(M.reflex.edge, a) * sched * (this.bankTarget - this.bankAngle) - skill(M.reflex.edgeDamp, a) * sched * rollRate;
+      const pMax = M.edgeFix * this.railZ;
+      const lim = this.usableZ + M.commit * s * Math.abs(side);
+      this.aimZ = clamp(hold + clamp(fix, -pMax, pMax), -lim, lim);
+    }
+    // aim along: trim
+    // (and, a reflex, back off the front foot when the nose drops toward the water: trim relative to
+    // the water surface along the board below noseTrim)
+    {
+      const ch = Math.hypot(bxx, bxz) || 1;
+      const slopeAlong = (this.waterSlopeX * bxx + this.waterSlopeZ * bxz) / ch;
+      const trimRel = Math.atan2(bxy, ch) - Math.atan(slopeAlong);
+      const pitchRate = w.x * bzx + w.y * bzy + w.z * bzz; // + = nose up (about the lateral axis)
+      const nose = Math.max(0, M.noseTrim - trimRel);
+      const back = skill(M.reflex.nose, a) * (nose - (nose > 0 ? M.noseDamp * Math.min(pitchRate, 0) : 0));
+      this.aimX = clamp(clamp(input.leanForward, -1, 1) * M.trimRange * s - back, -this.usableX, this.usableX);
+    }
+    // getting up: the body rises over the feet (plus the trim) — no edge or nose reflexes yet (the
+    // legs still push the board around under the hands)
+    if (this.stance === 'popping') {
+      this.aimZ = 0;
+      this.aimX = clamp(clamp(input.leanForward, -1, 1) * M.trimRange * s, -this.usableX, this.usableX);
+      aimVZ = frameVZ;
+    }
+    this.aimVelX = aimVX;
+    this.aimVelZ = aimVZ;
+    // COM velocity relative to the (moving) aim; the capture point (relative to the feet, in the
+    // frame turning with the board)
+    const relVX = vx * X.x + vy * X.y + vz * X.z;
+    const relVZ = vx * Z.x + vy * Z.y + vz * Z.z;
+    this.comVX = relVX - aimVX;
+    this.comVZ = relVZ - aimVZ;
+    this.comVU = vx * U.x + vy * U.y + vz * U.z;
+    this.captureX = this.comX + (relVX - frameVX) / w0;
+    this.captureZ = this.comZ + (relVZ - frameVZ) / w0;
+
+    // capture-point control → CoP command, clamped to the usable support
+    const k = skill(M.reflex.gain, a);
+    this.captureGain = k;
+    const f = 1 + k / w0;
+    // the balance law asks for a centroidal moment pivot (CMP); the CoP (feet) and the hip share it:
+    // the CoP goes where the rider wants the pressure (the aim; plus the trunk's return to
+    // neutral) as far as the hip can make up the difference, CMP = CoP − hip moment / load
+    const cmpX = this.aimX + f * (this.comX + this.comVX / w0 - this.aimX);
+    const cmpZ = this.aimZ + f * (this.comZ + this.comVZ / w0 - this.aimZ);
+    const load = cfg.mass * Math.max(g, M.minApparentG * GRAVITY);
+    const tauMax = skill(M.reflex.hip, a) * M.hipTorque * cfg.mass * s;
+    this.allocate(0, cmpX, load, tauMax);
+    this.allocate(1, cmpZ, load, tauMax);
+    this.ankleSaturated = this.copSatX || this.copSatZ;
+
+    // COM height: crouch input, plus a crouch reflex as the capture point nears the edge
+    const near = Math.max(Math.abs(this.captureX) / Math.max(this.footX, 1e-3), Math.abs(this.captureZ) / Math.max(this.footZ, 1e-3));
+    const crouch = clamp(clamp(input.crouch, 0, 1) + skill(M.reflex.crouch, a) * clamp((near - 0.5) / 0.5, 0, 1), 0, 1);
+    const hT = (cfg.standHeight + (cfg.crouchHeight - cfg.standHeight) * crouch) * s;
+    const dh = clamp((hT - this.heightTarget) * (1 - Math.exp(-dt / M.crouchLag)), -M.crouchRate * dt, M.crouchRate * dt);
+    this.heightTarget += dh;
+    this.heightRate = dh / dt;
+
+    // balance read-out: capture point over (support + recovery margin)
+    this.balanceRoll = this.captureZ / (this.footZ + M.recoverMargin);
+    this.balancePitch = this.captureX / (this.footX + M.recoverMargin);
+  }
+
+  /** Trunk (hip rotor) moment of inertia, kg·m². */
+  trunkInertia(): number {
+    return RIDER_MODEL.hipInertia * this.config.mass * this.scale * this.scale;
+  }
+
+  /**
+   * Share the CMP the balance law wants between the CoP and the hip moment along one axis
+   * (0 = e_x, 1 = e_z): the CoP takes the aim (+ the trunk's return), within the reach of the hip
+   * (its torque, less near the end of the trunk's range) and of the feet.
+   */
+  private allocate(axis: 0 | 1, cmp: number, load: number, tauMax: number): void {
+    const M = RIDER_MODEL;
+    const I = this.trunkInertia();
+    const th = axis === 0 ? this.trunkX : this.trunkZ;
+    const om = axis === 0 ? this.trunkVX : this.trunkVZ;
+    const aim = axis === 0 ? this.aimX : this.aimZ;
+    const use = axis === 0 ? this.usableX : this.usableZ;
+    // hip moment τ pushes the COM toward + and swings the trunk toward −: θ̈ = −τ/I. Room left
+    // in each direction, less the distance needed to stop the trunk at full torque
+    const range = M.hipRange;
+    const acc = tauMax / Math.max(I, 1e-6);
+    const brakeNeg = om < 0 ? (om * om) / (2 * acc) : 0;
+    const brakePos = om > 0 ? (om * om) / (2 * acc) : 0;
+    const soft = 0.3 * range;
+    const tauHi = tauMax * clamp((th + range - brakeNeg) / soft, -1, 1);
+    const tauLo = -tauMax * clamp((range - th - brakePos) / soft, -1, 1);
+    // trunk return to neutral (θ̈ = −ω²θ − 2ωθ̇)
+    const wr = M.hipReturn;
+    const tauRet = I * (wr * wr * th + 2 * wr * om);
+    let p = aim + tauRet / load;
+    p = clamp(p, cmp + tauLo / load, cmp + tauHi / load);
+    p = clamp(p, -use, use);
+    // the CMP within reach of this CoP
+    const lo = p - tauHi / load;
+    const hi = p - tauLo / load;
+    const sat = cmp < lo || cmp > hi;
+    const c = clamp(cmp, Math.min(lo, hi), Math.max(lo, hi));
+    if (axis === 0) {
+      this.copX = p;
+      this.cmpX = c;
+      this.copSatX = sat;
+    } else {
+      this.copZ = p;
+      this.cmpZ = c;
+      this.copSatZ = sat;
+    }
+  }
+
+  /**
+   * After the step's solve: the leg force's moment about the COM (the part of it that does not
+   * pass through the COM) turns the trunk. Uses this step's frame and CoP.
+   */
+  integrateTrunk(dt: number): void {
+    const F = this.legForce;
+    const U = this.frameU, X = this.frameX, Z = this.frameZ;
+    const N = F.x * U.x + F.y * U.y + F.z * U.z;
+    const fx = F.x * X.x + F.y * X.y + F.z * X.z;
+    const fz = F.x * Z.x + F.y * Z.y + F.z * Z.z;
+    const h = this.comHeight;
+    // F⟂ = (N/h)(r − p) + τ/h  ⇒  τ = h F⟂ − N (r − p)
+    this.hipX = h * fx - N * (this.comX - this.copX);
+    this.hipZ = h * fz - N * (this.comZ - this.copZ);
+    // the leg force pair's moment about u (feet at the CoP, body at the COM) — no hip rotation
+    // takes it: the feet's twisting grip on the deck carries it to the board (SurfSim)
+    this.legYawMoment = (this.comZ - this.copZ) * fx - (this.comX - this.copX) * fz;
+    const I = this.trunkInertia();
+    this.trunkVX -= (this.hipX / I) * dt;
+    this.trunkVZ -= (this.hipZ / I) * dt;
+    this.trunkX += this.trunkVX * dt;
+    this.trunkZ += this.trunkVZ * dt;
+  }
+
+  /** Update the filtered board + rider acceleration (call once per step with the system COM's
+   * acceleration from the external forces). */
   filterAcceleration(ax: number, ay: number, az: number, dt: number): void {
     const k = 1 - Math.exp(-dt / RIDER_MODEL.accelFilter);
     const f = this.accelFiltered;
@@ -861,20 +1100,16 @@ export class Rider {
     f.x += (ax - f.x) * k;
     f.y += (ay - f.y) * k;
     f.z += (az - f.z) * k;
-    const ks = 1 - Math.exp(-dt / RIDER_MODEL.accelFilterPitch);
-    const g = this.accelSlow;
-    g.x += (ax - g.x) * ks;
-    g.y += (ay - g.y) * ks;
-    g.z += (az - g.z) * ks;
   }
 
   /** Place the segments in the world (attached: rigid with the board; fallen: lying flat). */
   layoutSegments(board: RigidBody): void {
     if (this.stance !== 'fallen') {
-      // the layout is relative to the target COM; carry it with the actual rider COM
+      // the layout is relative to the body reference (target COM / standing COM); carry it with
+      // the actual rider COM
       for (let i = 0; i < this.segments.length; i++) {
         const sg = this.segments[i];
-        this.tmp.subVectors(this.segLocal[i], this.targetLocal);
+        this.tmp.subVectors(this.segLocal[i], this.segRefLocal);
         board.localDirToWorld(this.tmp, sg.center).add(this.position);
         board.localDirToWorld(this.segAxisLocal[i], sg.axis);
         sg.radius = this.segRadius[i];
@@ -1095,62 +1330,53 @@ export class Rider {
   }
 
   /**
-   * Balance bookkeeping from the effective leg force (on the rider, world): ankle torque about the
-   * feet relative to what the feet can resist. Returns true when the rider loses their feet.
+   * Balance bookkeeping after the step's solve: feet load and the standing fall checks (file
+   * header). Returns true when the rider is past recovery (`tipOver` says which way).
    */
   updateBalance(dt: number, board: RigidBody): boolean {
     const M = RIDER_MODEL;
+    this.tipOver = null;
     if (this.stance !== 'standing' && this.stance !== 'popping') {
       this.balanceRoll = 0;
       this.balancePitch = 0;
-      this.tipRoll = 0;
-      this.tipPitch = 0;
       this.balanceTimer = Math.max(this.balanceTimer - dt, 0);
+      this.slipTimer = 0;
       return false;
     }
-    // force of the legs on the board (local) and its moment about the feet midpoint
-    board.worldDirToLocal(this.legForce, this.tmp3).multiplyScalar(-1);
-    const F = this.tmp3;
-    const r = this.tmp.subVectors(this.targetLocal, this.feetMidLocal);
-    // ankle torques and feet load, low-passed: momentary unweighting over chop (≈ 50 ms) does
-    // not count
-    const kf = 1 - Math.exp(-dt / M.balanceFilter);
-    this.ankleRoll += (r.y * F.z - r.z * F.y - this.ankleRoll) * kf;
-    this.anklePitch += (r.x * F.y - r.y * F.x - this.anklePitch) * kf;
-    this.feetLoad += (Math.max(-F.y, 0) - this.feetLoad) * kf;
-    const N = this.feetLoad;
-    const w = this.standWeight();
-    const rollCap = M.rollLever * N + M.gripTorque;
-    const pitchCap = M.pitchLever * N + M.gripTorque;
-    // tip: angle of the body (feet → COM) from the apparent up g − a (fast filter), across and
-    // along the board. Gravity holds no torque about the feet along the apparent up; up to
-    // asin(lever / leg length) the ankles can hold the body, beyond that it tips over the edge of
-    // the feet, and `tipRoll`/`tipPitch` further the rider is past recovery. (Measured against the
-    // apparent up, not the board: a board pitching over chop under a steady body is no fall.)
-    board.worldToLocal(this.position, this.tmp2).sub(this.feetMidLocal);
-    const a = this.tmp2;
-    const af = this.accelSlow;
-    this.tmp.set(af.x, af.y + GRAVITY, af.z);
-    if (this.tmp.lengthSq() < 1) this.tmp.set(0, 1, 0);
-    board.worldDirToLocal(this.tmp.normalize(), this.tmp);
-    const u = this.tmp;
-    this.tipRoll = wrapAngle(Math.atan2(a.z, a.y) - Math.atan2(u.z, u.y));
-    this.tipPitch = wrapAngle(Math.atan2(a.x, a.y) - Math.atan2(u.x, u.y));
-    const hLeg = Math.max(a.length(), 0.3);
-    const holdRoll = Math.asin(Math.min(M.rollLever / hLeg, 0.9));
-    const holdPitch = Math.asin(Math.min(M.pitchLever / hLeg, 0.9));
-    const exR = Math.max(Math.abs(this.tipRoll) - holdRoll, 0) / M.tipRoll;
-    const exP = Math.max(Math.abs(this.tipPitch) - holdPitch, 0) / M.tipPitch;
-    // balance meter: foot pressure (ankle torque / what the feet hold, ≤ 1 while the feet hold)
-    // plus how far the body is past what the feet can hold, as a fraction of the recoverable tip
-    // (the rider falls when that part reaches 1)
-    this.balanceRoll = this.ankleRoll / rollCap + Math.sign(this.tipRoll) * exR;
-    this.balancePitch = this.anklePitch / pitchCap + Math.sign(this.tipPitch) * exP;
-    const over = Math.max(Math.abs(this.balanceRoll), Math.abs(this.balancePitch)) > 1 && w > 0.8;
-    if (over) this.balanceTimer += dt;
+    // feet load: the leg force pushing the rider away from the deck, low-passed (HUD)
+    const R = board.R;
+    const load = Math.max(this.legForce.x * R[1] + this.legForce.y * R[4] + this.legForce.z * R[7], 0);
+    this.feetLoad += (load - this.feetLoad) * (1 - Math.exp(-dt / M.balanceFilter));
+    if (this.stance !== 'standing') {
+      this.slipTimer = 0;
+      return false;
+    }
+    // capture point past the support + recovery margin (still going) with the body tipped past
+    // the edge of the feet by more than noReturn: nothing brings it back
+    const exX = Math.abs(this.captureX) - (this.footX + M.recoverMargin);
+    const exZ = Math.abs(this.captureZ) - (this.footZ + M.recoverMargin);
+    const tip = Math.max(this.comHeight, 0.3 * this.scale) * Math.tan(M.noReturn);
+    const outX = exX > 0 && Math.abs(this.comX) > this.footX + tip;
+    const outZ = exZ > 0 && Math.abs(this.comZ) > this.footZ + tip;
+    if (exX > 0 || exZ > 0) this.balanceTimer += dt;
     else this.balanceTimer = Math.max(this.balanceTimer - 2 * dt, 0);
-    this.tipOver = w > 0.8 && (exR > 1 || exP > 1) ? (exP > exR ? (this.tipPitch > 0 ? 'forward' : 'back') : 'side') : null;
-    return this.tipOver !== null;
+    if (outX || outZ) {
+      this.tipOver = outX && (!outZ || exX > exZ) ? (this.captureX > 0 ? 'forward' : 'back') : 'side';
+      return true;
+    }
+    // the upper body thrown far past what the hips can hold (a leg caught in the water)
+    const tLim = 2 * M.hipRange;
+    if (Math.abs(this.trunkX) > tLim || Math.abs(this.trunkZ) > tLim) {
+      this.tipOver = Math.abs(this.trunkX) > Math.abs(this.trunkZ) ? (this.trunkX > 0 ? 'forward' : 'back') : 'side';
+      return true;
+    }
+    // the feet slip off a deck tilted past the friction angle from the leg force
+    this.slipTimer = this.deckAngle > M.slipAngle && this.feetLoad > 0.3 * this.config.mass * GRAVITY ? this.slipTimer + dt : 0;
+    if (this.slipTimer > M.slipTime) {
+      this.tipOver = 'side';
+      return true;
+    }
+    return false;
   }
 
   /** Other wipeout criteria; returns the reason or null. Inputs from SurfSim. */
@@ -1165,8 +1391,9 @@ export class Rider {
     if (this.stance === 'fallen') return null;
     this.flipTimer = boardUpY < -0.2 ? this.flipTimer + dt : 0;
     if (this.flipTimer > 0.25) return 'flipped';
-    this.pearlTimer = noseDeckDepth > 0.06 && forwardSpeed > 2.5 ? this.pearlTimer + dt : Math.max(this.pearlTimer - dt, 0);
-    if (this.pearlTimer > 0.2) return 'pearl';
+    // the nose driven deep under at speed: the board stops dead under the rider
+    this.pearlTimer = noseDeckDepth > 0.15 && forwardSpeed > 2.5 ? this.pearlTimer + dt : Math.max(this.pearlTimer - dt, 0);
+    if (this.pearlTimer > 0.3) return 'pearl';
     this.buriedTimer = deckDepth > 0.7 ? this.buriedTimer + dt : 0;
     if (this.buriedTimer > 0.4) return 'buried';
     if (legStretch > RIDER_MODEL.impactStretch) return 'impact';
@@ -1212,10 +1439,6 @@ export interface StanceInput {
 export function boardYawRate(board: RigidBody): number {
   const R = board.R, w = board.angularVelocity;
   return -(w.x * R[1] + w.y * R[4] + w.z * R[7]);
-}
-
-function wrapAngle(a: number): number {
-  return a > Math.PI ? a - 2 * Math.PI : a < -Math.PI ? a + 2 * Math.PI : a;
 }
 
 function clamp(x: number, a: number, b: number): number {
