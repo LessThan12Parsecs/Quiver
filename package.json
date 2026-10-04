@@ -11,7 +11,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "check:gpu": "tsx tools/runGpuCheck.ts"
+    "check:gpu": "tsx tools/runGpuCheck.ts",
+    "shots": "tsx tools/screenshot.ts",
+    "smoke": "tsx tools/smoke.ts"
   },
   "dependencies": {
     "lil-gui": "^0.21.0",

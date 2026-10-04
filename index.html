@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Quiver — surf physics test build</title>
+    <style>
+      :root {
+        --panel: rgba(8, 16, 22, 0.52);
+        --panel-edge: rgba(255, 255, 255, 0.09);
+        --ink: #eaf3f6;
+        --dim: rgba(234, 243, 246, 0.58);
+        --accent: #5fe0c8;
+        --warn: #ffc857;
+        --bad: #ff6b5e;
+        --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+        --sans: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1218; color: var(--ink); font-family: var(--sans); }
+      #app, #app canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+      #app canvas { outline: none; touch-action: none; }
+      #hud { position: fixed; inset: 0; pointer-events: none; user-select: none; }
+      .panel {
+        background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 10px;
+        backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+        box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+      }
+      #hud-left { position: absolute; left: 14px; top: 14px; display: flex; flex-direction: column; gap: 10px; width: 262px; }
+      #hud-stats { padding: 12px 14px 10px; }
+      #hud-stats .speed { font: 600 38px/1 var(--mono); letter-spacing: -1px; }
+      #hud-stats .speed small { font: 500 13px var(--sans); color: var(--dim); margin-left: 6px; letter-spacing: 0; }
+      #hud-stats .sub { margin: 4px 0 10px; font: 500 12px var(--mono); color: var(--dim); }
+      #hud-stance { color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; }
+      #hud-stats dl { display: grid; grid-template-columns: 54px 1fr; gap: 3px 8px; margin: 0; font-size: 12px; }
+      #hud-stats dt { color: var(--dim); }
+      #hud-stats dd { margin: 0; font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .bar { position: relative; height: 5px; margin-top: 4px; border-radius: 3px; background: rgba(255, 255, 255, 0.12); overflow: hidden; }
+      .bar > i { position: absolute; left: 0; top: 0; bottom: 0; width: 0; border-radius: 3px; background: var(--accent); }
+      #hud-balance { padding: 10px 14px; display: flex; gap: 12px; align-items: center; transition: opacity 0.3s; }
+      #hud-balance.off { opacity: 0.35; }
+      #balance-dial { position: relative; width: 74px; height: 74px; flex: none; border-radius: 50%; background: radial-gradient(circle, rgba(95, 224, 200, 0.18) 0 44%, rgba(255, 200, 87, 0.12) 44% 62%, rgba(255, 107, 94, 0.16) 62% 100%); border: 1px solid var(--panel-edge); }
+      #balance-dial::before, #balance-dial::after { content: ''; position: absolute; background: rgba(255, 255, 255, 0.18); }
+      #balance-dial::before { left: 50%; top: 6px; bottom: 6px; width: 1px; }
+      #balance-dial::after { top: 50%; left: 6px; right: 6px; height: 1px; }
+      #balance-ring { position: absolute; left: 50%; top: 50%; width: 46px; height: 46px; margin: -23px 0 0 -23px; border-radius: 50%; border: 1.5px dashed rgba(255, 255, 255, 0.45); }
+      #balance-dot { position: absolute; left: 50%; top: 50%; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px rgba(95, 224, 200, 0.8); }
+      #balance-text { font-size: 12px; line-height: 1.5; color: var(--dim); }
+      #balance-text b { color: var(--ink); font: 600 13px var(--mono); }
+      #hud-ride { position: absolute; top: 18px; left: 50%; transform: translateX(-50%); padding: 7px 16px; border-radius: 999px; font: 600 14px var(--mono); letter-spacing: 0.04em; background: rgba(20, 120, 100, 0.55); border: 1px solid rgba(95, 224, 200, 0.5); opacity: 0; transition: opacity 0.25s; }
+      #hud-ride.on { opacity: 1; }
+      #hud-message { position: absolute; left: 50%; top: 30%; width: max-content; max-width: 86vw; transform: translate(-50%, -50%); text-align: center; opacity: 0; transition: opacity 0.3s; }
+      #hud-message.on { opacity: 1; }
+      #hud-message .big { font: 800 40px/1.05 var(--sans); letter-spacing: 0.02em; text-shadow: 0 2px 18px rgba(0, 0, 0, 0.45); }
+      #hud-message .small { margin-top: 8px; font: 500 15px var(--sans); color: var(--ink); text-shadow: 0 1px 8px rgba(0, 0, 0, 0.6); }
+      #hud-message.bad .big { color: #fff; }
+      #hud-hint { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); max-width: 70vw; padding: 8px 14px; font-size: 13px; text-align: center; opacity: 0; transition: opacity 0.4s; }
+      #hud-hint.on { opacity: 1; }
+      #hud-status { position: absolute; right: 14px; bottom: 14px; padding: 6px 10px; font: 500 11px var(--mono); color: var(--dim); }
+      #hud-status b { color: var(--warn); font-weight: 600; }
+      #help { position: absolute; right: 14px; top: 50%; transform: translateY(-50%); width: 270px; padding: 12px 14px; font-size: 12px; line-height: 1.45; pointer-events: auto; }
+      #help h2 { margin: 0 0 6px; font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+      #help table { width: 100%; border-collapse: collapse; }
+      #help td { padding: 2px 0; vertical-align: top; }
+      #help td:first-child { width: 66px; white-space: nowrap; }
+      #help kbd { display: inline-block; min-width: 14px; padding: 0 4px; border-radius: 4px; border: 1px solid rgba(255, 255, 255, 0.25); background: rgba(255, 255, 255, 0.08); font: 600 11px/16px var(--mono); text-align: center; }
+      #help .muted { color: var(--dim); }
+      #help p { margin: 8px 0 0; color: var(--dim); }
+      #help.hidden { display: none; }
+      #fatal { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px; text-align: center; font-size: 16px; background: #0b1218; }
+      body.clean #hud, body.clean .lil-gui { display: none !important; }
+      body.nohelp #help { display: none; }
+      @media (max-width: 760px) { #help { display: none; } #hud-left { width: 200px; } }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="hud">
+      <div id="hud-left">
+      <div id="hud-stats" class="panel">
+        <div class="speed"><span id="hud-speed">0</span><small>km/h</small></div>
+        <div class="sub"><span id="hud-speed-ms">0.0 m/s</span> · <span id="hud-stance">prone</span></div>
+        <dl>
+          <dt>board</dt><dd id="hud-board">—</dd>
+          <dt>sunk</dt><dd><span id="hud-volume">—</span><div class="bar"><i id="hud-volume-bar"></i></div></dd>
+          <dt>wave</dt><dd id="hud-wave">—</dd>
+          <dt>face</dt><dd><span id="hud-fullness">—</span><div class="bar"><i id="hud-fullness-bar"></i></div></dd>
+          <dt>depth</dt><dd id="hud-water">—</dd>
+          <dt>attitude</dt><dd id="hud-attitude">—</dd>
+          <dt>ride</dt><dd id="hud-ridetime">—</dd>
+        </dl>
+      </div>
+      <div id="hud-balance" class="panel">
+        <div id="balance-dial"><div id="balance-ring"></div><div id="balance-dot"></div></div>
+        <div id="balance-text">balance<br /><b id="balance-value">—</b><br /><span id="balance-detail"></span></div>
+      </div>
+      </div>
+      <div id="hud-ride">RIDING</div>
+      <div id="hud-message"><div class="big" id="hud-message-big"></div><div class="small" id="hud-message-small"></div></div>
+      <div id="hud-hint" class="panel"></div>
+      <div id="hud-status" class="panel"></div>
+      <div id="help" class="panel">
+        <h2>Controls</h2>
+        <table>
+          <tr><td><kbd>W</kbd> <kbd>↑</kbd></td><td>paddle <span class="muted">/ standing: weight forward</span></td></tr>
+          <tr><td><kbd>S</kbd> <kbd>↓</kbd></td><td><span class="muted">standing:</span> weight back</td></tr>
+          <tr><td><kbd>A</kbd> <kbd>D</kbd></td><td>steer <span class="muted">/ standing: lean on a rail</span></td></tr>
+          <tr><td><kbd>Q</kbd> <kbd>E</kbd></td><td><span class="muted">standing:</span> twist (yaw)</td></tr>
+          <tr><td><kbd>Shift</kbd></td><td><span class="muted">standing:</span> crouch</td></tr>
+          <tr><td><kbd>Space</kbd></td><td>pop up</td></tr>
+          <tr><td><kbd>R</kbd> <kbd>T</kbd></td><td>reset at lineup · spawn on a wave</td></tr>
+          <tr><td><kbd>C</kbd></td><td>camera: follow / orbit / beach / side</td></tr>
+          <tr><td><kbd>P</kbd> <kbd>[</kbd> <kbd>]</kbd></td><td>pause · slow-mo · speed up</td></tr>
+          <tr><td><kbd>.</kbd> <kbd>,</kbd></td><td>step a frame · a physics step</td></tr>
+          <tr><td><kbd>F</kbd></td><td>force arrows + water probes</td></tr>
+          <tr><td><kbd>H</kbd> <kbd>G</kbd></td><td>this help · debug panel</td></tr>
+        </table>
+        <p>Catch a set wave: point at the beach, paddle as the steep face arrives, pop up when the board starts to run. Keep the balance dot inside the ring. Mouse: drag to look around, wheel to zoom.</p>
+      </div>
+    </div>
+    <div id="fatal"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
